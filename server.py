@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Form
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Form, Body
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -39,6 +39,10 @@ async def validation_exception_handler(request, exc):
         status_code=422,
         content={"detail": ", ".join(detail), "body": str(exc.body)},
     )
+# ==================== MODELS ====================
+class ReorderRequest(BaseModel):
+    ids: List[str]
+
 api_router = APIRouter(prefix="/api")
 
 security = HTTPBearer()
@@ -101,6 +105,7 @@ TABLE_SCHEMAS = {
             content_text TEXT,
             quiz_id TEXT,
             is_document_available BOOLEAN DEFAULT FALSE,
+            session_index INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
@@ -538,6 +543,40 @@ def delete_module(cid: str, mid: str, admin=Depends(require_admin), db=Depends(g
     db.commit()
     
     # Return full course
+    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
+    return cur.fetchone()
+
+@api_router.put("/courses/{cid}/modules/reorder")
+def reorder_modules(cid: str, req: ReorderRequest, admin=Depends(require_admin), db=Depends(get_db)):
+    module_ids = req.ids
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(TABLE_SCHEMAS["courses"])
+    cur.execute("SELECT modules FROM courses WHERE id=%s", (cid,))
+    row = cur.fetchone()
+    if not row:
+        raise HTTPException(404, "Course not found")
+    
+    current_modules = row["modules"] or []
+    module_map = {m["id"]: m for m in current_modules}
+    
+    new_modules = []
+    for mid in module_ids:
+        if mid in module_map:
+            module = module_map[mid]
+            module["order"] = len(new_modules)
+            new_modules.append(module)
+            
+    # Add any modules not in the reorder list (shouldn't happen but for safety)
+    reordered_ids = set(module_ids)
+    for m in current_modules:
+        if m["id"] not in reordered_ids:
+            m["order"] = len(new_modules)
+            new_modules.append(m)
+            
+    cur.execute("UPDATE courses SET modules=%s WHERE id=%s",
+                (psycopg2.extras.Json(new_modules), cid))
+    db.commit()
+    
     cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
     return cur.fetchone()
 
@@ -981,12 +1020,19 @@ async def create_session(
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(TABLE_SCHEMAS["courses"])
     cur.execute(TABLE_SCHEMAS["sessions"])
+    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
+    
+    # Get last index for the module
+    cur.execute("SELECT MAX(session_index) FROM sessions WHERE module_id=%s", (module_id,))
+    max_idx_row = cur.fetchone()
+    next_idx = (max_idx_row["max"] + 1) if max_idx_row and max_idx_row["max"] is not None else 0
+
     cur.execute("""
         INSERT INTO sessions 
-        (id, course_id, module_id, name, duration_minutes, content_type, content_url, content_text, quiz_id, is_document_available)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (id, course_id, module_id, name, duration_minutes, content_type, content_url, content_text, quiz_id, is_document_available, session_index)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
-    """, (sid, course_id, module_id, name, duration, content_type, content_url, content_text, quiz_id, is_doc_bool))
+    """, (sid, course_id, module_id, name, duration, content_type, content_url, content_text, quiz_id, is_doc_bool, next_idx))
     
     session = cur.fetchone()
     db.commit()
@@ -996,7 +1042,8 @@ async def create_session(
 def get_sessions(cid: str, mid: str, user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("SELECT * FROM sessions WHERE course_id=%s AND module_id=%s ORDER BY created_at ASC", (cid, mid))
+    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
+    cur.execute("SELECT * FROM sessions WHERE course_id=%s AND module_id=%s ORDER BY session_index ASC, created_at ASC", (cid, mid))
     sessions = cur.fetchall()
     
     # Get progress
@@ -1098,6 +1145,19 @@ def delete_session(sid: str, admin=Depends(require_admin), db=Depends(get_db)):
         raise HTTPException(404, "Session not found")
     db.commit()
     return {"message": "Session deleted"}
+
+@api_router.put("/courses/{cid}/modules/{mid}/sessions/reorder")
+def reorder_sessions(cid: str, mid: str, req: ReorderRequest, admin=Depends(require_admin), db=Depends(get_db)):
+    session_ids = req.ids
+    cur = db.cursor()
+    cur.execute(TABLE_SCHEMAS["sessions"])
+    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
+    
+    for i, sid in enumerate(session_ids):
+        cur.execute("UPDATE sessions SET session_index=%s WHERE id=%s AND module_id=%s", (i, sid, mid))
+        
+    db.commit()
+    return {"message": "Sessions reordered"}
 
 @api_router.post("/sessions/{sid}/complete")
 def complete_session(sid: str, user=Depends(get_current_user), db=Depends(get_db)):
