@@ -83,14 +83,21 @@ TABLE_SCHEMAS = {
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT,
-            category TEXT,
             difficulty TEXT,
             tags JSONB,
-            modules JSONB DEFAULT '[]'::jsonb,
             thumbnail TEXT,
             created_by TEXT,
             created_at TIMESTAMP,
             is_published BOOLEAN DEFAULT FALSE
+        )
+    """,
+    "modules": """
+        CREATE TABLE IF NOT EXISTS modules (
+            id TEXT PRIMARY KEY,
+            course_id TEXT REFERENCES courses(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            order_index INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
     "sessions": """
@@ -102,6 +109,7 @@ TABLE_SCHEMAS = {
             duration_minutes INTEGER DEFAULT 0,
             content_type TEXT NOT NULL,
             content_url TEXT,
+            image_url TEXT,
             content_text TEXT,
             quiz_id TEXT,
             is_document_available BOOLEAN DEFAULT FALSE,
@@ -130,28 +138,29 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "progress": """
-        CREATE TABLE IF NOT EXISTS progress (
-            id TEXT PRIMARY KEY,
-            user_id TEXT NOT NULL,
-            course_id TEXT NOT NULL,
-            module_id TEXT NOT NULL,
-            completed BOOLEAN DEFAULT FALSE,
-            time_spent INTEGER DEFAULT 0,
-            completed_at TIMESTAMP,
-            UNIQUE(user_id, module_id)
-        )
-    """,
+
     "quizzes": """
         CREATE TABLE IF NOT EXISTS quizzes (
             id TEXT PRIMARY KEY,
             course_id TEXT,
             module_id TEXT,
+            session_id TEXT,
             title TEXT NOT NULL,
             questions JSONB DEFAULT '[]'::jsonb,
             passing_score INTEGER DEFAULT 70,
             time_limit_minutes INTEGER DEFAULT 30,
             created_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "quiz_attempts": """
+        CREATE TABLE IF NOT EXISTS quiz_attempts (
+            id TEXT PRIMARY KEY,
+            quiz_id TEXT,
+            user_id TEXT,
+            score INTEGER,
+            passed BOOLEAN,
+            responses JSONB,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
@@ -220,7 +229,6 @@ class UserCreate(BaseModel):
 class CourseCreate(BaseModel):
     title: str
     description: str
-    category: str
     difficulty: str = "beginner"
     tags: List[str] = []
     thumbnail: Optional[str] = None
@@ -261,7 +269,7 @@ def get_password_hash(password): return pwd_context.hash(password)
 def verify_password(p, h): return pwd_context.verify(p, h)
 
 def create_access_token(data):
-    data["exp"] = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    data["exp"] = datetime.now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
 
 def get_current_user(
@@ -294,7 +302,7 @@ def create_notification(uid, msg, ntype, db):
         INSERT INTO notifications
         (id, user_id, message, type, read, created_at)
         VALUES (%s,%s,%s,%s,%s,%s)
-    """, (generate_id(), uid, msg, ntype, False, datetime.utcnow()))
+    """, (generate_id(), uid, msg, ntype, False, datetime.now()))
     db.commit()
 
 # ==================== AUTH ROUTES ====================
@@ -318,7 +326,7 @@ def register(user: UserCreate, db=Depends(get_db)):
         user.name, user.role,
         psycopg2.extras.Json({"bio":"", "avatar":None}),
         psycopg2.extras.Json(user.interests),
-        datetime.utcnow()
+        datetime.now()
     ))
     db.commit()
     
@@ -391,37 +399,79 @@ def update_profile(
 
 # ==================== COURSES ====================
 @api_router.post("/courses")
-def create_course(course: CourseCreate, admin=Depends(require_admin), db=Depends(get_db)):
+def create_course(
+    title: str = Form(...),
+    description: str = Form(...),
+    difficulty: str = Form("beginner"),
+    tags: str = Form("[]"),
+    thumbnail: Optional[str] = Form(None),
+    is_published: str = Form("false"),
+    admin=Depends(require_admin),
+    db=Depends(get_db)
+):
+    import json
+    tags_list = json.loads(tags)
+    is_pub_bool = is_published.lower() == "true"
+    
     cid = generate_id()
     cur = db.cursor()
     cur.execute(TABLE_SCHEMAS["courses"])
     cur.execute("""
-        INSERT INTO courses VALUES
-        (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO courses (id, title, description, difficulty, tags, thumbnail, created_by, created_at, is_published)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
-        cid, course.title, course.description, course.category,
-        course.difficulty,
-        psycopg2.extras.Json(course.tags),
-        psycopg2.extras.Json([]),
-        course.thumbnail, admin["id"],
-        datetime.utcnow(), course.is_published
+        cid, title, description,
+        difficulty,
+        psycopg2.extras.Json(tags_list),
+        thumbnail, admin["id"],
+        datetime.now(), is_pub_bool
     ))
     db.commit()
     
     # Return the full course object
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
-    return cur.fetchone()
+    course = cur.fetchone()
+    course["modules"] = []
+    return course
 
 @api_router.get("/courses")
 def get_courses(db=Depends(get_db), user=Depends(get_current_user)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(TABLE_SCHEMAS["courses"])
-    if user["role"] == "admin":
-        cur.execute("SELECT * FROM courses")
-    else:
-        cur.execute("SELECT * FROM courses WHERE is_published=true")
-    return cur.fetchall()
+    
+    query = """
+        SELECT c.*, 
+               COALESCE(SUM(s.duration_minutes), 0) as total_duration,
+               COALESCE(COUNT(DISTINCT s.id), 0) as session_count
+        FROM courses c
+        LEFT JOIN sessions s ON c.id = s.course_id
+    """
+    
+    if user["role"] != "admin":
+        query += " WHERE c.is_published=true"
+        
+    query += " GROUP BY c.id"
+    
+    cur.execute(query)
+    courses = cur.fetchall()
+    
+    cur.execute("SELECT * FROM modules ORDER BY order_index ASC")
+    all_modules = cur.fetchall()
+    modules_by_course = {}
+    for m in all_modules:
+        cid = m["course_id"]
+        if cid not in modules_by_course:
+            modules_by_course[cid] = []
+        modules_by_course[cid].append(m)
+    
+    # Also add module count if not apparent from modules json
+    for course in courses:
+        modules = modules_by_course.get(course["id"], [])
+        course["modules"] = modules
+        course["module_count"] = len(modules)
+        
+    return courses
 
 @api_router.get("/courses/{cid}")
 def get_course(cid: str, db=Depends(get_db), user=Depends(get_current_user)):
@@ -431,6 +481,10 @@ def get_course(cid: str, db=Depends(get_db), user=Depends(get_current_user)):
     course = cur.fetchone()
     if not course:
         raise HTTPException(404, "Course not found")
+        
+    # Fetch modules
+    cur.execute("SELECT * FROM modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+    modules = cur.fetchall()
         
     # Fetch all sessions for this course to calculate module stats
     cur.execute(TABLE_SCHEMAS["sessions"])
@@ -447,7 +501,6 @@ def get_course(cid: str, db=Depends(get_db), user=Depends(get_current_user)):
         stats[mid]["total_duration"] += s["duration_minutes"]
         
     # Inject stats into modules
-    modules = course.get("modules", []) or []
     for m in modules:
         m_stats = stats.get(m["id"], {"session_count": 0, "total_duration": 0})
         m["session_count"] = m_stats["session_count"]
@@ -457,24 +510,65 @@ def get_course(cid: str, db=Depends(get_db), user=Depends(get_current_user)):
     return course
 
 @api_router.put("/courses/{cid}")
-def update_course(cid: str, course: CourseCreate, admin=Depends(require_admin), db=Depends(get_db)):
+def update_course(
+    cid: str,
+    title: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    difficulty: Optional[str] = Form(None),
+    tags: Optional[str] = Form(None),
+    thumbnail: Optional[str] = Form(None),
+    is_published: Optional[str] = Form(None),
+    admin=Depends(require_admin),
+    db=Depends(get_db)
+):
     cur = db.cursor()
     cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("""
-        UPDATE courses SET title=%s, description=%s, category=%s, difficulty=%s, tags=%s, thumbnail=%s, is_published=%s
-        WHERE id=%s
-    """, (
-        course.title, course.description, course.category, course.difficulty,
-        psycopg2.extras.Json(course.tags), course.thumbnail, course.is_published, cid
-    ))
-    if cur.rowcount == 0:
-        raise HTTPException(404, "Course not found")
+    
+    updates = []
+    values = []
+    
+    if title is not None:
+        updates.append("title=%s")
+        values.append(title)
+    if description is not None:
+        updates.append("description=%s")
+        values.append(description)
+    if difficulty is not None:
+        updates.append("difficulty=%s")
+        values.append(difficulty)
+    if tags is not None:
+        import json
+        updates.append("tags=%s")
+        values.append(psycopg2.extras.Json(json.loads(tags)))
+    if thumbnail is not None:
+        updates.append("thumbnail=%s")
+        values.append(thumbnail)
+    if is_published is not None:
+        updates.append("is_published=%s")
+        values.append(is_published.lower() == "true")
+        
+    if not updates:
+        # Return the full course object
+        cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
+        course = cur.fetchone()
+        cur.execute("SELECT * FROM modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+        course["modules"] = cur.fetchall()
+        return course
+
+    query = "UPDATE courses SET " + ", ".join(updates) + " WHERE id=%s"
+    values.append(cid)
+    
+    cur.execute(query, tuple(values))
     db.commit()
     
     # Return the full course object
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
-    return cur.fetchone()
+    course = cur.fetchone()
+    cur.execute("SELECT * FROM modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+    course["modules"] = cur.fetchall()
+    return course
 
 @api_router.put("/courses/{cid}/publish")
 def publish_course(cid: str, admin=Depends(require_admin), db=Depends(get_db)):
@@ -489,96 +583,52 @@ def publish_course(cid: str, admin=Depends(require_admin), db=Depends(get_db)):
 # ==================== MODULES ====================
 @api_router.post("/courses/{cid}/modules")
 def add_module(cid: str, module: ModuleContent, admin=Depends(require_admin), db=Depends(get_db)):
+    mid = module.id
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT modules FROM courses WHERE id=%s", (cid,))
-    row = cur.fetchone()
-    if not row:
+    cur.execute("SELECT id FROM courses WHERE id=%s", (cid,))
+    if not cur.fetchone():
         raise HTTPException(404, "Course not found")
-    modules = row["modules"] or []
-    module.order = len(modules)
-    modules.append(module.dict())
-    cur.execute("UPDATE courses SET modules=%s WHERE id=%s",
-                (psycopg2.extras.Json(modules), cid))
+        
+    cur.execute(TABLE_SCHEMAS["modules"])
+    cur.execute("SELECT MAX(order_index) as max_ord FROM modules WHERE course_id=%s", (cid,))
+    max_order = cur.fetchone()["max_ord"]
+    next_order = (max_order + 1) if max_order is not None else 0
+    
+    cur.execute("""
+        INSERT INTO modules (id, course_id, title, order_index)
+        VALUES (%s, %s, %s, %s)
+    """, (mid, cid, module.title, next_order))
     db.commit()
-    return {"message":"Module added"}
+    
+    return get_course(cid, db=db, user=admin)
 
 @api_router.put("/courses/{cid}/modules/{mid}")
 def update_module(cid: str, mid: str, module: ModuleContent, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT modules FROM courses WHERE id=%s", (cid,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "Course not found")
-    modules = row["modules"] or []
-    found = False
-    for i, m in enumerate(modules):
-        if m["id"] == mid:
-            modules[i] = {**module.dict(), "id": mid}
-            found = True
-            break
-    if not found:
+    cur.execute("UPDATE modules SET title=%s WHERE id=%s AND course_id=%s RETURNING id", (module.title, mid, cid))
+    if not cur.fetchone():
         raise HTTPException(404, "Module not found")
-    cur.execute("UPDATE courses SET modules=%s WHERE id=%s",
-                (psycopg2.extras.Json(modules), cid))
     db.commit()
-    
-    # Return full course
-    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
-    return cur.fetchone()
+    return get_course(cid, db=db, user=admin)
 
 @api_router.delete("/courses/{cid}/modules/{mid}")
 def delete_module(cid: str, mid: str, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT modules FROM courses WHERE id=%s", (cid,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "Course not found")
-    modules = row["modules"] or []
-    modules = [m for m in modules if m["id"] != mid]
-    cur.execute("UPDATE courses SET modules=%s WHERE id=%s",
-                (psycopg2.extras.Json(modules), cid))
+    cur.execute("DELETE FROM modules WHERE id=%s AND course_id=%s RETURNING id", (mid, cid))
+    if not cur.fetchone():
+        raise HTTPException(404, "Module not found")
     db.commit()
-    
-    # Return full course
-    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
-    return cur.fetchone()
+    return get_course(cid, db=db, user=admin)
 
 @api_router.put("/courses/{cid}/modules/reorder")
 def reorder_modules(cid: str, req: ReorderRequest, admin=Depends(require_admin), db=Depends(get_db)):
     module_ids = req.ids
-    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT modules FROM courses WHERE id=%s", (cid,))
-    row = cur.fetchone()
-    if not row:
-        raise HTTPException(404, "Course not found")
-    
-    current_modules = row["modules"] or []
-    module_map = {m["id"]: m for m in current_modules}
-    
-    new_modules = []
-    for mid in module_ids:
-        if mid in module_map:
-            module = module_map[mid]
-            module["order"] = len(new_modules)
-            new_modules.append(module)
-            
-    # Add any modules not in the reorder list (shouldn't happen but for safety)
-    reordered_ids = set(module_ids)
-    for m in current_modules:
-        if m["id"] not in reordered_ids:
-            m["order"] = len(new_modules)
-            new_modules.append(m)
-            
-    cur.execute("UPDATE courses SET modules=%s WHERE id=%s",
-                (psycopg2.extras.Json(new_modules), cid))
+    cur = db.cursor()
+    for i, mid in enumerate(module_ids):
+        cur.execute("UPDATE modules SET order_index=%s WHERE id=%s AND course_id=%s", (i, mid, cid))
     db.commit()
-    
-    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
-    return cur.fetchone()
+    return get_course(cid, db=db, user=admin)
 
 # ==================== ADMIN ====================
 @api_router.get("/admin/analytics")
@@ -658,7 +708,7 @@ def create_learning_path(path: LearningPathCreate, admin=Depends(require_admin),
         pid, path.title, path.description, 
         psycopg2.extras.Json(path.course_ids), 
         psycopg2.extras.Json(path.target_interests),
-        admin["id"], datetime.utcnow()
+        admin["id"], datetime.now()
     ))
     db.commit()
     return cur.fetchone()
@@ -666,37 +716,11 @@ def create_learning_path(path: LearningPathCreate, admin=Depends(require_admin),
 # ==================== PROGRESS ====================
 @api_router.get("/progress")
 def get_progress(user=Depends(get_current_user), db=Depends(get_db)):
-    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute(TABLE_SCHEMAS["progress"])
-        cur.execute("SELECT * FROM progress WHERE user_id=%s", (user["id"],))
-        return cur.fetchall()
-    except:
-        db.rollback()
-        return []
+    return []
 
 @api_router.post("/progress")
 def update_progress(data: ProgressUpdate, user=Depends(get_current_user), db=Depends(get_db)):
-    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    try:
-        cur.execute(TABLE_SCHEMAS["progress"])
-        cur.execute("""
-            INSERT INTO progress (id, user_id, course_id, module_id, completed, time_spent, completed_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (user_id, module_id) DO UPDATE SET
-            completed=EXCLUDED.completed,
-            time_spent=progress.time_spent + EXCLUDED.time_spent,
-            completed_at=CASE WHEN EXCLUDED.completed THEN EXCLUDED.completed_at ELSE progress.completed_at END
-            RETURNING *
-        """, (
-            str(generate_id()), user["id"], data.course_id, data.module_id,
-            data.completed, data.time_spent, datetime.utcnow() if data.completed else None
-        ))
-        db.commit()
-        return cur.fetchone()
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(500, str(e))
+    return {"status": "deprecated, use sessions"}
 
 @api_router.get("/progress/course/{cid}")
 def get_course_progress(cid: str, user=Depends(get_current_user), db=Depends(get_db)):
@@ -715,21 +739,13 @@ def get_course_progress(cid: str, user=Depends(get_current_user), db=Depends(get
         
         pct = (completed_sessions / total_sessions * 100) if total_sessions > 0 else 0
         
-        # Get module progress (legacy/granular)
-        try:
-            cur.execute(TABLE_SCHEMAS["progress"])
-            cur.execute("SELECT * FROM progress WHERE user_id=%s AND course_id=%s", (user["id"], cid))
-            module_progress = cur.fetchall()
-        except:
-            module_progress = []
-
         return {
             "total_sessions": total_sessions,
             "completed_sessions": completed_sessions,
             "progress_percentage": pct,
-            "total_modules": 0, # Deprecated but kept for type safety if needed temporarily
-            "completed_modules": 0, # Deprecated
-            "module_progress": module_progress
+            "total_modules": 0, 
+            "completed_modules": 0, 
+            "module_progress": []
         }
     except Exception as e:
         print(f"Error in course progress: {e}")
@@ -772,22 +788,12 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
             if cc["course_id"] in course_map:
                 course_map[cc["course_id"]]["completed_sessions"] = cc["count"]
         
-        # Identify active courses (from both new session_progress and old module progress)
         active_course_ids = set()
         
         # 1. From session_progress
         cur.execute("SELECT DISTINCT course_id FROM session_progress WHERE user_id=%s", (user["id"],))
         for row in cur.fetchall():
             active_course_ids.add(row["course_id"])
-            
-        # 2. From old progress (modules)
-        try:
-            cur.execute(TABLE_SCHEMAS["progress"])
-            cur.execute("SELECT DISTINCT course_id FROM progress WHERE user_id=%s", (user["id"],))
-            for row in cur.fetchall():
-                active_course_ids.add(row["course_id"])
-        except:
-            pass # Old table might not exist or verify failed, ignore
         
         # Calculate stats
         total_courses_enrolled = 0
@@ -880,15 +886,12 @@ def create_quiz(data: Dict[str, Any], admin=Depends(require_admin), db=Depends(g
         psycopg2.extras.Json(data.get("questions", [])),
         data.get("passing_score", 70),
         data.get("time_limit_minutes", 30),
-        admin["id"], datetime.utcnow()
+        admin["id"], datetime.now()
     ))
     db.commit()
     return cur.fetchone()
 
-@api_router.post("/quizzes/{qid}/submit")
-def submit_quiz(qid: str, data: Dict[str, Any], user=Depends(get_current_user), db=Depends(get_db)):
-    # Very simplified submission logic
-    return {"score": 100, "passed": True}
+
 
 # ==================== DISCUSSIONS ====================
 @api_router.get("/discussions")
@@ -916,7 +919,7 @@ def create_discussion(data: Dict[str, Any], user=Depends(get_current_user), db=D
         RETURNING *
     """, (
         did, data.get("course_id"), data.get("title"), data.get("content"),
-        user["id"], user["name"], datetime.utcnow()
+        user["id"], user["name"], datetime.now()
     ))
     db.commit()
     return cur.fetchone()
@@ -947,7 +950,7 @@ def ask_question(data: Dict[str, Any], user=Depends(get_current_user), db=Depend
         RETURNING *
     """, (
         qid, data.get("course_id"), data.get("question"),
-        user["id"], user["name"], "pending", datetime.utcnow()
+        user["id"], user["name"], "pending", datetime.now()
     ))
     db.commit()
     return cur.fetchone()
@@ -1003,6 +1006,7 @@ async def create_session(
     content_text: Optional[str] = Form(None),
     quiz_id: Optional[str] = Form(None),
     content_url: Optional[str] = Form(None),
+    image_url: Optional[str] = Form(None),
     is_document_available: str = Form("false"),
     admin=Depends(require_admin),
     db=Depends(get_db)
@@ -1021,6 +1025,7 @@ async def create_session(
     cur.execute(TABLE_SCHEMAS["courses"])
     cur.execute(TABLE_SCHEMAS["sessions"])
     cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
+    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS image_url TEXT")
     
     # Get last index for the module
     cur.execute("SELECT MAX(session_index) FROM sessions WHERE module_id=%s", (module_id,))
@@ -1029,10 +1034,10 @@ async def create_session(
 
     cur.execute("""
         INSERT INTO sessions 
-        (id, course_id, module_id, name, duration_minutes, content_type, content_url, content_text, quiz_id, is_document_available, session_index)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (id, course_id, module_id, name, duration_minutes, content_type, content_url, image_url, content_text, quiz_id, is_document_available, session_index)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
-    """, (sid, course_id, module_id, name, duration, content_type, content_url, content_text, quiz_id, is_doc_bool, next_idx))
+    """, (sid, course_id, module_id, name, duration, content_type, content_url, image_url, content_text, quiz_id, is_doc_bool, next_idx))
     
     session = cur.fetchone()
     db.commit()
@@ -1075,6 +1080,7 @@ async def update_session(
     content_text: Optional[str] = Form(None),
     quiz_id: Optional[str] = Form(None),
     content_url: Optional[str] = Form(None),
+    image_url: Optional[str] = Form(None),
     is_document_available: Optional[str] = Form(None),
     admin=Depends(require_admin),
     db=Depends(get_db)
@@ -1118,6 +1124,10 @@ async def update_session(
     if content_url is not None:
         updates.append("content_url=%s")
         values.append(content_url)
+        
+    if image_url is not None:
+        updates.append("image_url=%s")
+        values.append(image_url)
         
     if is_document_available is not None:
         is_doc = is_document_available.lower() == "true"
@@ -1180,14 +1190,14 @@ def complete_session(sid: str, user=Depends(get_current_user), db=Depends(get_db
         cur.execute("""
             UPDATE session_progress SET completed=true, completed_at=%s 
             WHERE user_id=%s AND session_id=%s
-        """, (datetime.utcnow(), user["id"], sid))
+        """, (datetime.now(), user["id"], sid))
     else:
         # Insert
         progress_id = generate_id()
         cur.execute("""
             INSERT INTO session_progress (id, user_id, session_id, course_id, module_id, completed, completed_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (progress_id, user["id"], sid, session["course_id"], session["module_id"], True, datetime.utcnow()))
+        """, (progress_id, user["id"], sid, session["course_id"], session["module_id"], True, datetime.now()))
     
     db.commit()
     return {"message": "Session completed", "session_id": sid}
@@ -1205,60 +1215,107 @@ def get_session_progress(sid: str, user=Depends(get_current_user), db=Depends(ge
 class QuizCreate(BaseModel):
     title: str
     course_id: Optional[str] = None
-    description: Optional[str] = None
+    module_id: Optional[str] = None
+    session_id: str
     questions: List[Dict[str, Any]] = []
+    passing_score: int = 70
+    time_limit_minutes: int = 30
+
+class QuizSubmit(BaseModel):
+    quiz_id: str
+    answers: Dict[str, Any]
 
 # ==================== QUIZZES ====================
 @api_router.get("/quizzes")
-def get_quizzes(course_id: Optional[str] = None, db=Depends(get_db)):
+def get_quizzes(course_id: Optional[str] = None, session_id: Optional[str] = None, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(TABLE_SCHEMAS["quizzes"])
     
-    if course_id:
+    if session_id:
+        cur.execute("SELECT * FROM quizzes WHERE session_id=%s ORDER BY created_at DESC", (session_id,))
+    elif course_id:
         cur.execute("SELECT * FROM quizzes WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
     else:
         cur.execute("SELECT * FROM quizzes ORDER BY created_at DESC")
         
     return cur.fetchall()
 
+@api_router.get("/quizzes/{qid}")
+def get_quiz(qid: str, db=Depends(get_db)):
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM quizzes WHERE id=%s", (qid,))
+    quiz = cur.fetchone()
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+    return quiz
+
 @api_router.post("/quizzes")
 def create_quiz(
     quiz_data: QuizCreate,
+    admin=Depends(require_admin),
     db=Depends(get_db)
 ):
     qid = generate_id()
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["quizzes"])
     
     cur.execute("""
-        INSERT INTO quizzes (id, title, course_id, questions)
-        VALUES (%s, %s, %s, %s)
+        INSERT INTO quizzes (id, title, course_id, module_id, session_id, questions, passing_score, time_limit_minutes, created_by, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
-    """, (qid, quiz_data.title, quiz_data.course_id, psycopg2.extras.Json(quiz_data.questions)))
+    """, (qid, quiz_data.title, quiz_data.course_id, quiz_data.module_id, quiz_data.session_id, psycopg2.extras.Json(quiz_data.questions), quiz_data.passing_score, quiz_data.time_limit_minutes, admin["id"], datetime.now()))
     
     new_quiz = cur.fetchone()
+    
+    # Also update the session to point to this quiz (backward compatibility/convenience)
+    cur.execute("UPDATE sessions SET quiz_id=%s WHERE id=%s", (qid, quiz_data.session_id))
+    
     db.commit()
     return new_quiz
 
+@api_router.post("/quizzes/{qid}/submit")
+def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=Depends(get_db)):
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM quizzes WHERE id=%s", (qid,))
+    quiz = cur.fetchone()
+    if not quiz:
+        raise HTTPException(404, "Quiz not found")
+        
+    responses = data.answers
+    questions = quiz.get("questions", [])
+    
+    correct_count = 0
+    total_questions = len(questions)
+    
+    for q in questions:
+        q_id = str(q.get("id"))
+        user_ans = responses.get(q_id)
+        correct_ans = q.get("correctOption") if q.get("correctOption") is not None else q.get("answer")
+        
+        # ensure type conversion matches for comparison
+        if str(user_ans) == str(correct_ans):
+            correct_count += 1
+            
+    score = int((correct_count / total_questions) * 100) if total_questions > 0 else 0
+    passed = score >= (quiz.get("passing_score") or 70)
+    
+    attempt_id = generate_id()
+    cur.execute("""
+        INSERT INTO quiz_attempts (id, quiz_id, user_id, score, passed, responses)
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING *
+    """, (attempt_id, qid, user["id"], score, passed, psycopg2.extras.Json(responses)))
+    
+    attempt = cur.fetchone()
+    db.commit()
+    return {"score": score, "passed": passed, "attempt": attempt}
 
-# ==================== CATEGORIES ====================
-@api_router.get("/categories")
-def get_categories():
-    return [
-        "Programming",
-        "Data Science",
-        "Web Development",
-        "Mobile Development",
-        "Design",
-        "Business",
-        "Marketing",
-        "Finance",
-    ]
+
+
 
 # ==================== HEALTH ====================
 @api_router.get("/health")
 def health():
-    return {"status":"ok","time":datetime.utcnow()}
+    return {"status":"ok","time":datetime.now()}
 
 # ==================== FINAL ====================
 app.include_router(api_router) 
