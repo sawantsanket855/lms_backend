@@ -21,11 +21,11 @@ def migrate():
     try:
         print("Starting migration...")
         
-        # 1. Create new modules table
+        # 1. Create new lms_modules table
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS modules (
+            CREATE TABLE IF NOT EXISTS lms_modules (
                 id TEXT PRIMARY KEY,
-                course_id TEXT REFERENCES courses(id) ON DELETE CASCADE,
+                course_id TEXT REFERENCES lms_courses(id) ON DELETE CASCADE,
                 title TEXT NOT NULL,
                 order_index INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -33,11 +33,11 @@ def migrate():
         """)
         print("Created modules table.")
 
-        # 2. Extract JSONB modules from courses and insert into new modules table
-        # Only do this if courses has a 'modules' column
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='courses' AND column_name='modules'")
+        # 2. Extract JSONB modules from lms_courses and insert into new lms_modules table
+        # Only do this if lms_courses has a 'modules' column
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='lms_courses' AND column_name='modules'")
         if cur.fetchone():
-            cur.execute("SELECT id, modules FROM courses")
+            cur.execute("SELECT id, modules FROM lms_courses")
             courses = cur.fetchall()
             modules_inserted = 0
             for course in courses:
@@ -56,26 +56,26 @@ def migrate():
                         mid = m.get("id") or f"{cid}-m{idx}"
                         title = m.get("title", f"Module {idx+1}")
                         # Check if exists
-                        cur.execute("SELECT id FROM modules WHERE id=%s", (mid,))
+                        cur.execute("SELECT id FROM lms_modules WHERE id=%s", (mid,))
                         if not cur.fetchone():
                             cur.execute("""
-                                INSERT INTO modules (id, course_id, title, order_index)
+                                INSERT INTO lms_modules (id, course_id, title, order_index)
                                 VALUES (%s, %s, %s, %s)
                             """, (mid, cid, title, m.get("order", idx)))
                             modules_inserted += 1
 
             print(f"Migrated {modules_inserted} modules from JSON to relational table.")
 
-            # 3. Drop modules and category columns from courses
-            cur.execute("ALTER TABLE courses DROP COLUMN IF EXISTS modules")
-            cur.execute("ALTER TABLE courses DROP COLUMN IF EXISTS category")
-            print("Dropped deprecated columns from courses.")
+            # 3. Drop modules and category columns from lms_courses
+            cur.execute("ALTER TABLE lms_courses DROP COLUMN IF EXISTS modules")
+            cur.execute("ALTER TABLE lms_courses DROP COLUMN IF EXISTS category")
+            print("Dropped deprecated columns from lms_courses.")
         else:
-            print("courses.modules column does not exist, skipping JSON migration.")
+            print("lms_courses.modules column does not exist, skipping JSON migration.")
 
-        # 4. Create quiz_attempts table
+        # 4. Create lms_quiz_attempts table
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS quiz_attempts (
+            CREATE TABLE IF NOT EXISTS lms_quiz_attempts (
                 id TEXT PRIMARY KEY,
                 quiz_id TEXT,
                 user_id TEXT,
@@ -85,13 +85,13 @@ def migrate():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        print("Created quiz_attempts table.")
+        print("Created lms_quiz_attempts table.")
 
-        # 5. Add session_id to quizzes
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='quizzes' AND column_name='session_id'")
+        # 5. Add session_id to lms_quizzes
+        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='lms_quizzes' AND column_name='session_id'")
         if not cur.fetchone():
-            cur.execute("ALTER TABLE quizzes ADD COLUMN session_id TEXT")
-            print("Added session_id to quizzes.")
+            cur.execute("ALTER TABLE lms_quizzes ADD COLUMN session_id TEXT")
+            print("Added session_id to lms_quizzes.")
 
         # 6. Delete old progress table, ensure session_progress exists.
         cur.execute("DROP TABLE IF EXISTS progress")

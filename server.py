@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Form, Body
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Form, Body, File, UploadFile, Response
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -7,13 +8,12 @@ from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
 from psycopg2.pool import SimpleConnectionPool
 import psycopg2, psycopg2.extras
-import os, time
+import os, time, io
 
 from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
 
 # ==================== ENV & APP ====================
 ROOT_DIR = Path(__file__).parent
@@ -66,8 +66,8 @@ def get_db():
         pool.putconn(conn)
 
 TABLE_SCHEMAS = {
-    "users": """
-        CREATE TABLE IF NOT EXISTS users (
+    "lms_users": """
+        CREATE TABLE IF NOT EXISTS lms_users (
             id TEXT PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
@@ -78,8 +78,8 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "courses": """
-        CREATE TABLE IF NOT EXISTS courses (
+    "lms_courses": """
+        CREATE TABLE IF NOT EXISTS lms_courses (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT,
@@ -88,22 +88,35 @@ TABLE_SCHEMAS = {
             thumbnail TEXT,
             created_by TEXT,
             created_at TIMESTAMP,
-            is_published BOOLEAN DEFAULT FALSE
+            is_published BOOLEAN DEFAULT FALSE,
+            thumbnail_id TEXT
         )
     """,
-    "modules": """
-        CREATE TABLE IF NOT EXISTS modules (
+    "lms_media_files": """
+        CREATE TABLE IF NOT EXISTS lms_media_files (
             id TEXT PRIMARY KEY,
-            course_id TEXT REFERENCES courses(id) ON DELETE CASCADE,
+            file_name TEXT NOT NULL,
+            file_type TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            file_data BYTEA NOT NULL,
+            file_size INTEGER NOT NULL,
+            uploaded_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
+    "lms_modules": """
+        CREATE TABLE IF NOT EXISTS lms_modules (
+            id TEXT PRIMARY KEY,
+            course_id TEXT REFERENCES lms_courses(id) ON DELETE CASCADE,
             title TEXT NOT NULL,
             order_index INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "sessions": """
-        CREATE TABLE IF NOT EXISTS sessions (
+    "lms_sessions": """
+        CREATE TABLE IF NOT EXISTS lms_sessions (
             id TEXT PRIMARY KEY,
-            course_id TEXT REFERENCES courses(id) ON DELETE CASCADE,
+            course_id TEXT REFERENCES lms_courses(id) ON DELETE CASCADE,
             module_id TEXT NOT NULL,
             name TEXT NOT NULL,
             duration_minutes INTEGER DEFAULT 0,
@@ -112,13 +125,14 @@ TABLE_SCHEMAS = {
             image_url TEXT,
             content_text TEXT,
             quiz_id TEXT,
+            media_id TEXT,
             is_document_available BOOLEAN DEFAULT FALSE,
             session_index INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "notifications": """
-        CREATE TABLE IF NOT EXISTS notifications (
+    "lms_notifications": """
+        CREATE TABLE IF NOT EXISTS lms_notifications (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
             message TEXT NOT NULL,
@@ -127,8 +141,8 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "learning_paths": """
-        CREATE TABLE IF NOT EXISTS learning_paths (
+    "lms_learning_paths": """
+        CREATE TABLE IF NOT EXISTS lms_learning_paths (
             id TEXT PRIMARY KEY,
             title TEXT NOT NULL,
             description TEXT,
@@ -139,8 +153,8 @@ TABLE_SCHEMAS = {
         )
     """,
 
-    "quizzes": """
-        CREATE TABLE IF NOT EXISTS quizzes (
+    "lms_quizzes": """
+        CREATE TABLE IF NOT EXISTS lms_quizzes (
             id TEXT PRIMARY KEY,
             course_id TEXT,
             module_id TEXT,
@@ -153,8 +167,8 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "quiz_attempts": """
-        CREATE TABLE IF NOT EXISTS quiz_attempts (
+    "lms_quiz_attempts": """
+        CREATE TABLE IF NOT EXISTS lms_quiz_attempts (
             id TEXT PRIMARY KEY,
             quiz_id TEXT,
             user_id TEXT,
@@ -164,8 +178,8 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "discussions": """
-        CREATE TABLE IF NOT EXISTS discussions (
+    "lms_discussions": """
+        CREATE TABLE IF NOT EXISTS lms_discussions (
             id TEXT PRIMARY KEY,
             course_id TEXT,
             title TEXT NOT NULL,
@@ -175,8 +189,8 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "expert_questions": """
-        CREATE TABLE IF NOT EXISTS expert_questions (
+    "lms_expert_questions": """
+        CREATE TABLE IF NOT EXISTS lms_expert_questions (
             id TEXT PRIMARY KEY,
             course_id TEXT,
             question TEXT NOT NULL,
@@ -188,8 +202,8 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
-    "certificates": """
-        CREATE TABLE IF NOT EXISTS certificates (
+    "lms_certificates": """
+        CREATE TABLE IF NOT EXISTS lms_certificates (
             id TEXT PRIMARY KEY,
             user_id TEXT NOT NULL,
             course_id TEXT NOT NULL,
@@ -197,8 +211,8 @@ TABLE_SCHEMAS = {
             certificate_url TEXT
         )
     """,
-    "session_progress": """
-        CREATE TABLE IF NOT EXISTS session_progress (
+    "lms_session_progress": """
+        CREATE TABLE IF NOT EXISTS lms_session_progress (
             id TEXT PRIMARY KEY, 
             user_id TEXT, 
             session_id TEXT, 
@@ -212,6 +226,27 @@ TABLE_SCHEMAS = {
         )
     """
 }
+
+# ==================== DB INIT ====================
+def init_db():
+    print("🚀 Initializing database tables...")
+    conn = pool.getconn()
+    try:
+        cur = conn.cursor()
+        for table_name, schema in TABLE_SCHEMAS.items():
+            print(f"  - Ensuring table: {table_name}")
+            cur.execute(schema)
+        conn.commit()
+        print("✅ Database initialization complete.")
+    except Exception as e:
+        print(f"❌ Database initialization failed: {e}")
+        conn.rollback()
+    finally:
+        pool.putconn(conn)
+
+@app.on_event("startup")
+async def startup_event():
+    init_db()
 
 # ==================== HELPERS ====================
 def generate_id():
@@ -280,8 +315,8 @@ def get_current_user(
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         uid = payload.get("sub")
         cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(TABLE_SCHEMAS["users"])
-        cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
+        cur.execute(TABLE_SCHEMAS["lms_users"])
+        cur.execute("SELECT * FROM lms_users WHERE id=%s", (uid,))
         user = cur.fetchone()
         if not user:
             raise HTTPException(401, "User not found")
@@ -297,9 +332,9 @@ def require_admin(user=Depends(get_current_user)):
 # ==================== NOTIFICATIONS ====================
 def create_notification(uid, msg, ntype, db):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["notifications"])
+    cur.execute(TABLE_SCHEMAS["lms_notifications"])
     cur.execute("""
-        INSERT INTO notifications
+        INSERT INTO lms_notifications
         (id, user_id, message, type, read, created_at)
         VALUES (%s,%s,%s,%s,%s,%s)
     """, (generate_id(), uid, msg, ntype, False, datetime.now()))
@@ -309,14 +344,14 @@ def create_notification(uid, msg, ntype, db):
 @api_router.post("/auth/register")
 def register(user: UserCreate, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["users"])
-    cur.execute("SELECT 1 FROM users WHERE email=%s", (user.email.lower(),))
+    cur.execute(TABLE_SCHEMAS["lms_users"])
+    cur.execute("SELECT 1 FROM lms_users WHERE email=%s", (user.email.lower(),))
     if cur.fetchone():
         raise HTTPException(400, "Email exists")
 
     uid = generate_id()
     cur.execute("""
-        INSERT INTO users
+        INSERT INTO lms_users
         (id,email,password_hash,name,role,profile,interests,created_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
@@ -331,7 +366,7 @@ def register(user: UserCreate, db=Depends(get_db)):
     db.commit()
     
     # Fetch the created user to return user data
-    cur.execute("SELECT * FROM users WHERE id=%s", (uid,))
+    cur.execute("SELECT * FROM lms_users WHERE id=%s", (uid,))
     new_user = cur.fetchone()
     user_data = dict(new_user)
     user_data.pop("password_hash", None)
@@ -344,8 +379,8 @@ def register(user: UserCreate, db=Depends(get_db)):
 @api_router.post("/auth/login")
 def login(data: Dict[str,str], db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["users"])
-    cur.execute("SELECT * FROM users WHERE email=%s", (data["email"].lower(),))
+    cur.execute(TABLE_SCHEMAS["lms_users"])
+    cur.execute("SELECT * FROM lms_users WHERE email=%s", (data["email"].lower(),))
     user = cur.fetchone()
     if not user or not data["password"] == user["password_hash"]:
         raise HTTPException(401, "Invalid credentials")
@@ -377,13 +412,13 @@ def update_profile(
     db=Depends(get_db)
 ):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["users"])
+    cur.execute(TABLE_SCHEMAS["lms_users"])
     profile = user["profile"] or {"bio": "", "avatar": None}
     if bio is not None:
         profile["bio"] = bio
     
     cur.execute("""
-        UPDATE users SET 
+        UPDATE lms_users SET 
         name=COALESCE(%s, name),
         profile=%s,
         interests=%s
@@ -391,7 +426,7 @@ def update_profile(
     """, (name, psycopg2.extras.Json(profile), psycopg2.extras.Json(data.interests), user["id"]))
     db.commit()
     
-    cur.execute("SELECT * FROM users WHERE id=%s", (user["id"],))
+    cur.execute("SELECT * FROM lms_users WHERE id=%s", (user["id"],))
     updated_user = cur.fetchone()
     user_data = dict(updated_user)
     user_data.pop("password_hash", None)
@@ -405,6 +440,7 @@ def create_course(
     difficulty: str = Form("beginner"),
     tags: str = Form("[]"),
     thumbnail: Optional[str] = Form(None),
+    thumbnail_id: Optional[str] = Form(None),
     is_published: str = Form("false"),
     admin=Depends(require_admin),
     db=Depends(get_db)
@@ -415,22 +451,22 @@ def create_course(
     
     cid = generate_id()
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["courses"])
+    cur.execute(TABLE_SCHEMAS["lms_courses"])
     cur.execute("""
-        INSERT INTO courses (id, title, description, difficulty, tags, thumbnail, created_by, created_at, is_published)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO lms_courses (id, title, description, difficulty, tags, thumbnail, thumbnail_id, created_by, created_at, is_published)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
     """, (
         cid, title, description,
         difficulty,
         psycopg2.extras.Json(tags_list),
-        thumbnail, admin["id"],
+        thumbnail, thumbnail_id, admin["id"],
         datetime.now(), is_pub_bool
     ))
     db.commit()
     
     # Return the full course object
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
+    cur.execute("SELECT * FROM lms_courses WHERE id=%s", (cid,))
     course = cur.fetchone()
     course["modules"] = []
     return course
@@ -438,14 +474,13 @@ def create_course(
 @api_router.get("/courses")
 def get_courses(db=Depends(get_db), user=Depends(get_current_user)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
     
     query = """
         SELECT c.*, 
                COALESCE(SUM(s.duration_minutes), 0) as total_duration,
                COALESCE(COUNT(DISTINCT s.id), 0) as session_count
-        FROM courses c
-        LEFT JOIN sessions s ON c.id = s.course_id
+        FROM lms_courses c
+        LEFT JOIN lms_sessions s ON c.id = s.course_id
     """
     
     if user["role"] != "admin":
@@ -456,7 +491,7 @@ def get_courses(db=Depends(get_db), user=Depends(get_current_user)):
     cur.execute(query)
     courses = cur.fetchall()
     
-    cur.execute("SELECT * FROM modules ORDER BY order_index ASC")
+    cur.execute("SELECT * FROM lms_modules ORDER BY order_index ASC")
     all_modules = cur.fetchall()
     modules_by_course = {}
     for m in all_modules:
@@ -476,19 +511,17 @@ def get_courses(db=Depends(get_db), user=Depends(get_current_user)):
 @api_router.get("/courses/{cid}")
 def get_course(cid: str, db=Depends(get_db), user=Depends(get_current_user)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
+    cur.execute("SELECT * FROM lms_courses WHERE id=%s", (cid,))
     course = cur.fetchone()
     if not course:
         raise HTTPException(404, "Course not found")
         
     # Fetch modules
-    cur.execute("SELECT * FROM modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+    cur.execute("SELECT * FROM lms_modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
     modules = cur.fetchall()
         
     # Fetch all sessions for this course to calculate module stats
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("SELECT module_id, duration_minutes FROM sessions WHERE course_id=%s", (cid,))
+    cur.execute("SELECT module_id, duration_minutes FROM lms_sessions WHERE course_id=%s", (cid,))
     all_sessions = cur.fetchall()
     
     # Aggregate stats
@@ -517,12 +550,12 @@ def update_course(
     difficulty: Optional[str] = Form(None),
     tags: Optional[str] = Form(None),
     thumbnail: Optional[str] = Form(None),
+    thumbnail_id: Optional[str] = Form(None),
     is_published: Optional[str] = Form(None),
     admin=Depends(require_admin),
     db=Depends(get_db)
 ):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["courses"])
     
     updates = []
     values = []
@@ -543,6 +576,9 @@ def update_course(
     if thumbnail is not None:
         updates.append("thumbnail=%s")
         values.append(thumbnail)
+    if thumbnail_id is not None:
+        updates.append("thumbnail_id=%s")
+        values.append(thumbnail_id)
     if is_published is not None:
         updates.append("is_published=%s")
         values.append(is_published.lower() == "true")
@@ -550,31 +586,39 @@ def update_course(
     if not updates:
         # Return the full course object
         cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
+        cur.execute("SELECT * FROM lms_courses WHERE id=%s", (cid,))
         course = cur.fetchone()
-        cur.execute("SELECT * FROM modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+        cur.execute("SELECT * FROM lms_modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
         course["modules"] = cur.fetchall()
         return course
 
-    query = "UPDATE courses SET " + ", ".join(updates) + " WHERE id=%s"
+    query = "UPDATE lms_courses SET " + ", ".join(updates) + " WHERE id=%s RETURNING *"
     values.append(cid)
     
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute(query, tuple(values))
+    updated_course = cur.fetchone()
     db.commit()
+
+    # Get modules to complete the course object
+    cur.execute("SELECT * FROM lms_modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+    updated_course["modules"] = cur.fetchall()
+    
+    return updated_course
     
     # Return the full course object
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM courses WHERE id=%s", (cid,))
+    cur.execute("SELECT * FROM lms_courses WHERE id=%s", (cid,))
     course = cur.fetchone()
-    cur.execute("SELECT * FROM modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
+    cur.execute("SELECT * FROM lms_modules WHERE course_id=%s ORDER BY order_index ASC", (cid,))
     course["modules"] = cur.fetchall()
     return course
 
 @api_router.put("/courses/{cid}/publish")
 def publish_course(cid: str, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("UPDATE courses SET is_published=true WHERE id=%s", (cid,))
+    cur.execute(TABLE_SCHEMAS["lms_courses"])
+    cur.execute("UPDATE lms_courses SET is_published=true WHERE id=%s", (cid,))
     if cur.rowcount == 0:
         raise HTTPException(404, "Not found")
     db.commit()
@@ -585,18 +629,18 @@ def publish_course(cid: str, admin=Depends(require_admin), db=Depends(get_db)):
 def add_module(cid: str, module: ModuleContent, admin=Depends(require_admin), db=Depends(get_db)):
     mid = module.id
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT id FROM courses WHERE id=%s", (cid,))
+    cur.execute(TABLE_SCHEMAS["lms_courses"])
+    cur.execute("SELECT id FROM lms_courses WHERE id=%s", (cid,))
     if not cur.fetchone():
         raise HTTPException(404, "Course not found")
         
-    cur.execute(TABLE_SCHEMAS["modules"])
-    cur.execute("SELECT MAX(order_index) as max_ord FROM modules WHERE course_id=%s", (cid,))
+    cur.execute(TABLE_SCHEMAS["lms_modules"])
+    cur.execute("SELECT MAX(order_index) as max_ord FROM lms_modules WHERE course_id=%s", (cid,))
     max_order = cur.fetchone()["max_ord"]
     next_order = (max_order + 1) if max_order is not None else 0
     
     cur.execute("""
-        INSERT INTO modules (id, course_id, title, order_index)
+        INSERT INTO lms_modules (id, course_id, title, order_index)
         VALUES (%s, %s, %s, %s)
     """, (mid, cid, module.title, next_order))
     db.commit()
@@ -606,7 +650,7 @@ def add_module(cid: str, module: ModuleContent, admin=Depends(require_admin), db
 @api_router.put("/courses/{cid}/modules/{mid}")
 def update_module(cid: str, mid: str, module: ModuleContent, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("UPDATE modules SET title=%s WHERE id=%s AND course_id=%s RETURNING id", (module.title, mid, cid))
+    cur.execute("UPDATE lms_modules SET title=%s WHERE id=%s AND course_id=%s RETURNING id", (module.title, mid, cid))
     if not cur.fetchone():
         raise HTTPException(404, "Module not found")
     db.commit()
@@ -615,7 +659,7 @@ def update_module(cid: str, mid: str, module: ModuleContent, admin=Depends(requi
 @api_router.delete("/courses/{cid}/modules/{mid}")
 def delete_module(cid: str, mid: str, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("DELETE FROM modules WHERE id=%s AND course_id=%s RETURNING id", (mid, cid))
+    cur.execute("DELETE FROM lms_modules WHERE id=%s AND course_id=%s RETURNING id", (mid, cid))
     if not cur.fetchone():
         raise HTTPException(404, "Module not found")
     db.commit()
@@ -626,7 +670,7 @@ def reorder_modules(cid: str, req: ReorderRequest, admin=Depends(require_admin),
     module_ids = req.ids
     cur = db.cursor()
     for i, mid in enumerate(module_ids):
-        cur.execute("UPDATE modules SET order_index=%s WHERE id=%s AND course_id=%s", (i, mid, cid))
+        cur.execute("UPDATE lms_modules SET order_index=%s WHERE id=%s AND course_id=%s", (i, mid, cid))
     db.commit()
     return get_course(cid, db=db, user=admin)
 
@@ -634,20 +678,20 @@ def reorder_modules(cid: str, req: ReorderRequest, admin=Depends(require_admin),
 @api_router.get("/admin/analytics")
 def get_analytics(admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["users"])
-    cur.execute("SELECT count(*) FROM users")
+    cur.execute(TABLE_SCHEMAS["lms_users"])
+    cur.execute("SELECT count(*) FROM lms_users")
     user_count = cur.fetchone()[0]
     
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute("SELECT count(*) FROM courses")
+    cur.execute(TABLE_SCHEMAS["lms_courses"])
+    cur.execute("SELECT count(*) FROM lms_courses")
     course_count = cur.fetchone()[0]
     
-    cur.execute(TABLE_SCHEMAS["quizzes"])
-    cur.execute("SELECT count(*) FROM quizzes")
+    cur.execute(TABLE_SCHEMAS["lms_quizzes"])
+    cur.execute("SELECT count(*) FROM lms_quizzes")
     quiz_count = cur.fetchone()[0]
         
-    cur.execute(TABLE_SCHEMAS["certificates"])
-    cur.execute("SELECT count(*) FROM certificates")
+    cur.execute(TABLE_SCHEMAS["lms_certificates"])
+    cur.execute("SELECT count(*) FROM lms_certificates")
     cert_count = cur.fetchone()[0]
         
     return {
@@ -660,8 +704,8 @@ def get_analytics(admin=Depends(require_admin), db=Depends(get_db)):
 @api_router.get("/admin/users")
 def get_admin_users(admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["users"])
-    cur.execute("SELECT * FROM users ORDER BY created_at DESC")
+    cur.execute(TABLE_SCHEMAS["lms_users"])
+    cur.execute("SELECT * FROM lms_users ORDER BY created_at DESC")
     users = cur.fetchall()
     for u in users:
         u.pop("password_hash", None)
@@ -672,8 +716,8 @@ def get_admin_users(admin=Depends(require_admin), db=Depends(get_db)):
 def get_learning_paths(db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(TABLE_SCHEMAS["learning_paths"])
-        cur.execute("SELECT * FROM learning_paths")
+        cur.execute(TABLE_SCHEMAS["lms_learning_paths"])
+        cur.execute("SELECT * FROM lms_learning_paths")
         return cur.fetchall()
     except:
         db.rollback()
@@ -687,9 +731,9 @@ def get_recommended_paths(user=Depends(get_current_user), db=Depends(get_db)):
         # Simple recommendation based on user interests
         interests = user.get("interests", [])
         if not interests:
-            cur.execute("SELECT * FROM learning_paths LIMIT 5")
+            cur.execute("SELECT * FROM lms_learning_paths LIMIT 5")
         else:
-            cur.execute("SELECT * FROM learning_paths WHERE target_interests ?| %s", (interests,))
+            cur.execute("SELECT * FROM lms_learning_paths WHERE target_interests ?| %s", (interests,))
         return cur.fetchall()
     except:
         db.rollback()
@@ -699,9 +743,9 @@ def get_recommended_paths(user=Depends(get_current_user), db=Depends(get_db)):
 def create_learning_path(path: LearningPathCreate, admin=Depends(require_admin), db=Depends(get_db)):
     pid = generate_id()
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["learning_paths"])
+    cur.execute(TABLE_SCHEMAS["lms_learning_paths"])
     cur.execute("""
-        INSERT INTO learning_paths (id, title, description, course_ids, target_interests, created_by, created_at)
+        INSERT INTO lms_learning_paths (id, title, description, course_ids, target_interests, created_by, created_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s)
         RETURNING *
     """, (
@@ -727,25 +771,58 @@ def get_course_progress(cid: str, user=Depends(get_current_user), db=Depends(get
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         # Get total sessions
-        cur.execute(TABLE_SCHEMAS["sessions"])
-        cur.execute("SELECT count(*) FROM sessions WHERE course_id=%s", (cid,))
+        cur.execute(TABLE_SCHEMAS["lms_sessions"])
+        cur.execute("SELECT count(*) FROM lms_sessions WHERE course_id=%s", (cid,))
         total_sessions = cur.fetchone()["count"]
         
         # Get completed sessions
-        # Get completed sessions
-        cur.execute(TABLE_SCHEMAS["session_progress"])
-        cur.execute("SELECT count(DISTINCT session_id) FROM session_progress WHERE user_id=%s AND course_id=%s AND completed=true", (user["id"], cid))
+        cur.execute(TABLE_SCHEMAS["lms_session_progress"])
+        cur.execute("SELECT count(DISTINCT session_id) FROM lms_session_progress WHERE user_id=%s AND course_id=%s AND completed=true", (user["id"], cid))
         completed_sessions = cur.fetchone()["count"]
+ 
+        # Get modules for this course
+        cur.execute(TABLE_SCHEMAS["lms_modules"])
+        cur.execute("SELECT id, title FROM lms_modules WHERE course_id=%s", (cid,))
+        modules = cur.fetchall()
+        total_modules = len(modules)
         
+        # Get total sessions per module
+        cur.execute("SELECT module_id, count(*) FROM lms_sessions WHERE course_id=%s GROUP BY module_id", (cid,))
+        mod_session_counts = {row["module_id"]: row["count"] for row in cur.fetchall()}
+        
+        # Get completed sessions per module
+        cur.execute("SELECT module_id, count(*) FROM lms_session_progress WHERE user_id=%s AND course_id=%s AND completed=true GROUP BY module_id", (user["id"], cid))
+        mod_completed_counts = {row["module_id"]: row["count"] for row in cur.fetchall()}
+        
+        module_progress = []
+        completed_modules = 0
+        
+        for m in modules:
+            m_id = m["id"]
+            total_m = mod_session_counts.get(m_id, 0)
+            completed_m = mod_completed_counts.get(m_id, 0)
+            is_completed = total_m > 0 and completed_m >= total_m
+            
+            if is_completed:
+                completed_modules += 1
+                
+            module_progress.append({
+                "module_id": m_id,
+                "module_title": m["title"],
+                "total_sessions": total_m,
+                "completed_sessions": completed_m,
+                "completed": is_completed
+            })
+            
         pct = (completed_sessions / total_sessions * 100) if total_sessions > 0 else 0
         
         return {
             "total_sessions": total_sessions,
             "completed_sessions": completed_sessions,
             "progress_percentage": pct,
-            "total_modules": 0, 
-            "completed_modules": 0, 
-            "module_progress": []
+            "total_modules": total_modules,
+            "completed_modules": completed_modules,
+            "module_progress": module_progress
         }
     except Exception as e:
         print(f"Error in course progress: {e}")
@@ -754,6 +831,8 @@ def get_course_progress(cid: str, user=Depends(get_current_user), db=Depends(get
             "total_sessions": 0,
             "completed_sessions": 0,
             "progress_percentage": 0,
+            "total_modules": 0,
+            "completed_modules": 0,
             "module_progress": []
         }
 
@@ -762,24 +841,24 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         # Get all courses to calculate totals
-        cur.execute(TABLE_SCHEMAS["courses"])
-        cur.execute("SELECT id, title, thumbnail FROM courses")
+        cur.execute(TABLE_SCHEMAS["lms_courses"])
+        cur.execute("SELECT id, title, thumbnail FROM lms_courses")
         courses = cur.fetchall()
         course_map = {c["id"]: {**c, "total_sessions": 0, "completed_sessions": 0} for c in courses}
         
         # Get total sessions count per course
-        cur.execute(TABLE_SCHEMAS["sessions"])
-        cur.execute("SELECT course_id, count(*) as count FROM sessions GROUP BY course_id")
+        cur.execute(TABLE_SCHEMAS["lms_sessions"])
+        cur.execute("SELECT course_id, count(*) as count FROM lms_sessions GROUP BY course_id")
         session_counts = cur.fetchall()
         for sc in session_counts:
             if sc["course_id"] in course_map:
                 course_map[sc["course_id"]]["total_sessions"] = sc["count"]
         
         # Get completed sessions for user
-        cur.execute(TABLE_SCHEMAS["session_progress"])
+        cur.execute(TABLE_SCHEMAS["lms_session_progress"])
         cur.execute("""
             SELECT course_id, count(DISTINCT session_id) as count 
-            FROM session_progress 
+            FROM lms_session_progress 
             WHERE user_id=%s AND completed=true 
             GROUP BY course_id
         """, (user["id"],))
@@ -791,7 +870,7 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
         active_course_ids = set()
         
         # 1. From session_progress
-        cur.execute("SELECT DISTINCT course_id FROM session_progress WHERE user_id=%s", (user["id"],))
+        cur.execute("SELECT DISTINCT course_id FROM lms_session_progress WHERE user_id=%s", (user["id"],))
         for row in cur.fetchall():
             active_course_ids.add(row["course_id"])
         
@@ -819,12 +898,12 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
                 })
         
         # Get certificates count
-        cur.execute(TABLE_SCHEMAS["certificates"])
-        cur.execute("SELECT count(*) FROM certificates WHERE user_id=%s", (user["id"],))
+        cur.execute(TABLE_SCHEMAS["lms_certificates"])
+        cur.execute("SELECT count(*) FROM lms_certificates WHERE user_id=%s", (user["id"],))
         cert_count = cur.fetchone()[0]
         
         # Get total time spent
-        cur.execute("SELECT sum(time_spent_minutes) FROM session_progress WHERE user_id=%s", (user["id"],))
+        cur.execute("SELECT sum(time_spent_minutes) FROM lms_session_progress WHERE user_id=%s", (user["id"],))
         total_time = cur.fetchone()["sum"] or 0
 
         return {
@@ -852,11 +931,11 @@ def get_dashboard_stats(user=Depends(get_current_user), db=Depends(get_db)):
 def get_quizzes(course_id: Optional[str] = None, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(TABLE_SCHEMAS["quizzes"])
+        cur.execute(TABLE_SCHEMAS["lms_quizzes"])
         if course_id:
-            cur.execute("SELECT * FROM quizzes WHERE course_id=%s", (course_id,))
+            cur.execute("SELECT * FROM lms_quizzes WHERE course_id=%s", (course_id,))
         else:
-            cur.execute("SELECT * FROM quizzes")
+            cur.execute("SELECT * FROM lms_quizzes")
         return cur.fetchall()
     except:
         db.rollback()
@@ -865,8 +944,8 @@ def get_quizzes(course_id: Optional[str] = None, db=Depends(get_db)):
 @api_router.get("/quizzes/{qid}")
 def get_quiz(qid: str, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["quizzes"])
-    cur.execute("SELECT * FROM quizzes WHERE id=%s", (qid,))
+    cur.execute(TABLE_SCHEMAS["lms_quizzes"])
+    cur.execute("SELECT * FROM lms_quizzes WHERE id=%s", (qid,))
     quiz = cur.fetchone()
     if not quiz:
         raise HTTPException(404, "Quiz not found")
@@ -876,9 +955,9 @@ def get_quiz(qid: str, db=Depends(get_db)):
 def create_quiz(data: Dict[str, Any], admin=Depends(require_admin), db=Depends(get_db)):
     qid = generate_id()
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["quizzes"])
+    cur.execute(TABLE_SCHEMAS["lms_quizzes"])
     cur.execute("""
-        INSERT INTO quizzes (id, course_id, module_id, title, questions, passing_score, time_limit_minutes, created_by, created_at)
+        INSERT INTO lms_quizzes (id, course_id, module_id, title, questions, passing_score, time_limit_minutes, created_by, created_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
         RETURNING *
     """, (
@@ -898,11 +977,11 @@ def create_quiz(data: Dict[str, Any], admin=Depends(require_admin), db=Depends(g
 def get_discussions(course_id: Optional[str] = None, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(TABLE_SCHEMAS["discussions"])
+        cur.execute(TABLE_SCHEMAS["lms_discussions"])
         if course_id:
-            cur.execute("SELECT * FROM discussions WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
+            cur.execute("SELECT * FROM lms_discussions WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
         else:
-            cur.execute("SELECT * FROM discussions ORDER BY created_at DESC")
+            cur.execute("SELECT * FROM lms_discussions ORDER BY created_at DESC")
         return cur.fetchall()
     except:
         db.rollback()
@@ -912,9 +991,9 @@ def get_discussions(course_id: Optional[str] = None, db=Depends(get_db)):
 def create_discussion(data: Dict[str, Any], user=Depends(get_current_user), db=Depends(get_db)):
     did = generate_id()
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["discussions"])
+    cur.execute(TABLE_SCHEMAS["lms_discussions"])
     cur.execute("""
-        INSERT INTO discussions (id, course_id, title, content, author_id, author_name, created_at)
+        INSERT INTO lms_discussions (id, course_id, title, content, author_id, author_name, created_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s)
         RETURNING *
     """, (
@@ -929,11 +1008,11 @@ def create_discussion(data: Dict[str, Any], user=Depends(get_current_user), db=D
 def get_expert_questions(course_id: Optional[str] = None, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(TABLE_SCHEMAS["expert_questions"])
+        cur.execute(TABLE_SCHEMAS["lms_expert_questions"])
         if course_id:
-            cur.execute("SELECT * FROM expert_questions WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
+            cur.execute("SELECT * FROM lms_expert_questions WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
         else:
-            cur.execute("SELECT * FROM expert_questions ORDER BY created_at DESC")
+            cur.execute("SELECT * FROM lms_expert_questions ORDER BY created_at DESC")
         return cur.fetchall()
     except:
         db.rollback()
@@ -943,9 +1022,9 @@ def get_expert_questions(course_id: Optional[str] = None, db=Depends(get_db)):
 def ask_question(data: Dict[str, Any], user=Depends(get_current_user), db=Depends(get_db)):
     qid = generate_id()
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["expert_questions"])
+    cur.execute(TABLE_SCHEMAS["lms_expert_questions"])
     cur.execute("""
-        INSERT INTO expert_questions (id, course_id, question, asked_by, asked_by_name, status, created_at)
+        INSERT INTO lms_expert_questions (id, course_id, question, asked_by, asked_by_name, status, created_at)
         VALUES (%s,%s,%s,%s,%s,%s,%s)
         RETURNING *
     """, (
@@ -960,8 +1039,8 @@ def ask_question(data: Dict[str, Any], user=Depends(get_current_user), db=Depend
 def get_certificates(user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(TABLE_SCHEMAS["certificates"])
-        cur.execute("SELECT * FROM certificates WHERE user_id=%s", (user["id"],))
+        cur.execute(TABLE_SCHEMAS["lms_certificates"])
+        cur.execute("SELECT * FROM lms_certificates WHERE user_id=%s", (user["id"],))
         return cur.fetchall()
     except:
         db.rollback()
@@ -972,8 +1051,8 @@ def get_certificates(user=Depends(get_current_user), db=Depends(get_db)):
 def get_notifications(user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
-        cur.execute(TABLE_SCHEMAS["notifications"])
-        cur.execute("SELECT * FROM notifications WHERE user_id=%s ORDER BY created_at DESC", (user["id"],))
+        cur.execute(TABLE_SCHEMAS["lms_notifications"])
+        cur.execute("SELECT * FROM lms_notifications WHERE user_id=%s ORDER BY created_at DESC", (user["id"],))
         return cur.fetchall()
     except:
         db.rollback()
@@ -982,16 +1061,16 @@ def get_notifications(user=Depends(get_current_user), db=Depends(get_db)):
 @api_router.put("/notifications/{nid}/read")
 def mark_notification_read(nid: str, user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["notifications"])
-    cur.execute("UPDATE notifications SET read=true WHERE id=%s AND user_id=%s", (nid, user["id"]))
+    cur.execute(TABLE_SCHEMAS["lms_notifications"])
+    cur.execute("UPDATE lms_notifications SET read=true WHERE id=%s AND user_id=%s", (nid, user["id"]))
     db.commit()
     return {"status": "success"}
 
 @api_router.put("/notifications/read-all")
 def mark_all_notifications_read(user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["notifications"])
-    cur.execute("UPDATE notifications SET read=true WHERE user_id=%s", (user["id"],))
+    cur.execute(TABLE_SCHEMAS["lms_notifications"])
+    cur.execute("UPDATE lms_notifications SET read=true WHERE user_id=%s", (user["id"],))
     db.commit()
     return {"status": "success"}
 
@@ -1007,6 +1086,7 @@ async def create_session(
     quiz_id: Optional[str] = Form(None),
     content_url: Optional[str] = Form(None),
     image_url: Optional[str] = Form(None),
+    media_id: Optional[str] = Form(None),
     is_document_available: str = Form("false"),
     admin=Depends(require_admin),
     db=Depends(get_db)
@@ -1022,22 +1102,19 @@ async def create_session(
 
     
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["courses"])
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
-    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS image_url TEXT")
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
     
     # Get last index for the module
-    cur.execute("SELECT MAX(session_index) FROM sessions WHERE module_id=%s", (module_id,))
+    cur.execute("SELECT MAX(session_index) FROM lms_sessions WHERE module_id=%s", (module_id,))
     max_idx_row = cur.fetchone()
     next_idx = (max_idx_row["max"] + 1) if max_idx_row and max_idx_row["max"] is not None else 0
 
     cur.execute("""
-        INSERT INTO sessions 
-        (id, course_id, module_id, name, duration_minutes, content_type, content_url, image_url, content_text, quiz_id, is_document_available, session_index)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        INSERT INTO lms_sessions 
+        (id, course_id, module_id, name, duration_minutes, content_type, content_url, image_url, media_id, content_text, quiz_id, is_document_available, session_index)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
-    """, (sid, course_id, module_id, name, duration, content_type, content_url, image_url, content_text, quiz_id, is_doc_bool, next_idx))
+    """, (sid, course_id, module_id, name, duration, content_type, content_url, image_url, media_id, content_text, quiz_id, is_doc_bool, next_idx))
     
     session = cur.fetchone()
     db.commit()
@@ -1046,14 +1123,14 @@ async def create_session(
 @api_router.get("/courses/{cid}/modules/{mid}/sessions")
 def get_sessions(cid: str, mid: str, user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
-    cur.execute("SELECT * FROM sessions WHERE course_id=%s AND module_id=%s ORDER BY session_index ASC, created_at ASC", (cid, mid))
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
+    cur.execute("ALTER TABLE lms_sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
+    cur.execute("SELECT * FROM lms_sessions WHERE course_id=%s AND module_id=%s ORDER BY session_index ASC, created_at ASC", (cid, mid))
     sessions = cur.fetchall()
     
     # Get progress
-    cur.execute(TABLE_SCHEMAS["session_progress"])
-    cur.execute("SELECT session_id FROM session_progress WHERE user_id=%s AND course_id=%s AND module_id=%s AND completed=true", (user["id"], cid, mid))
+    cur.execute(TABLE_SCHEMAS["lms_session_progress"])
+    cur.execute("SELECT session_id FROM lms_session_progress WHERE user_id=%s AND course_id=%s AND module_id=%s AND completed=true", (user["id"], cid, mid))
     completed_ids = {row["session_id"] for row in cur.fetchall()}
     
     for s in sessions:
@@ -1064,8 +1141,8 @@ def get_sessions(cid: str, mid: str, user=Depends(get_current_user), db=Depends(
 @api_router.get("/sessions/{sid}")
 def get_session(sid: str, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("SELECT * FROM sessions WHERE id=%s", (sid,))
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
+    cur.execute("SELECT * FROM lms_sessions WHERE id=%s", (sid,))
     session = cur.fetchone()
     if not session:
         raise HTTPException(404, "Session not found")
@@ -1088,8 +1165,8 @@ async def update_session(
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     
     # Check if session exists
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("SELECT * FROM sessions WHERE id=%s", (sid,))
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
+    cur.execute("SELECT * FROM lms_sessions WHERE id=%s", (sid,))
     session = cur.fetchone()
     if not session:
         raise HTTPException(404, "Session not found")
@@ -1138,7 +1215,7 @@ async def update_session(
         return session
         
     values.append(sid)
-    query = f"UPDATE sessions SET {', '.join(updates)} WHERE id=%s RETURNING *"
+    query = f"UPDATE lms_sessions SET {', '.join(updates)} WHERE id=%s RETURNING *"
     
     cur.execute(query, tuple(values))
     updated_session = cur.fetchone()
@@ -1149,8 +1226,8 @@ async def update_session(
 @api_router.delete("/sessions/{sid}")
 def delete_session(sid: str, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("DELETE FROM sessions WHERE id=%s", (sid,))
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
+    cur.execute("DELETE FROM lms_sessions WHERE id=%s", (sid,))
     if cur.rowcount == 0:
         raise HTTPException(404, "Session not found")
     db.commit()
@@ -1160,11 +1237,11 @@ def delete_session(sid: str, admin=Depends(require_admin), db=Depends(get_db)):
 def reorder_sessions(cid: str, mid: str, req: ReorderRequest, admin=Depends(require_admin), db=Depends(get_db)):
     session_ids = req.ids
     cur = db.cursor()
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("ALTER TABLE sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
+    cur.execute("ALTER TABLE lms_sessions ADD COLUMN IF NOT EXISTS session_index INTEGER DEFAULT 0")
     
     for i, sid in enumerate(session_ids):
-        cur.execute("UPDATE sessions SET session_index=%s WHERE id=%s AND module_id=%s", (i, sid, mid))
+        cur.execute("UPDATE lms_sessions SET session_index=%s WHERE id=%s AND module_id=%s", (i, sid, mid))
         
     db.commit()
     return {"message": "Sessions reordered"}
@@ -1172,30 +1249,30 @@ def reorder_sessions(cid: str, mid: str, req: ReorderRequest, admin=Depends(requ
 @api_router.post("/sessions/{sid}/complete")
 def complete_session(sid: str, user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["session_progress"])
+    cur.execute(TABLE_SCHEMAS["lms_session_progress"])
     
     # Get session details
-    cur.execute(TABLE_SCHEMAS["sessions"])
-    cur.execute("SELECT course_id, module_id FROM sessions WHERE id=%s", (sid,))
+    cur.execute(TABLE_SCHEMAS["lms_sessions"])
+    cur.execute("SELECT course_id, module_id FROM lms_sessions WHERE id=%s", (sid,))
     session = cur.fetchone()
     if not session:
         raise HTTPException(404, "Session not found")
     
     # Check if already completed
-    cur.execute("SELECT * FROM session_progress WHERE user_id=%s AND session_id=%s", (user["id"], sid))
+    cur.execute("SELECT * FROM lms_session_progress WHERE user_id=%s AND session_id=%s", (user["id"], sid))
     existing = cur.fetchone()
     
     if existing:
         # Update
         cur.execute("""
-            UPDATE session_progress SET completed=true, completed_at=%s 
+            UPDATE lms_session_progress SET completed=true, completed_at=%s 
             WHERE user_id=%s AND session_id=%s
         """, (datetime.now(), user["id"], sid))
     else:
         # Insert
         progress_id = generate_id()
         cur.execute("""
-            INSERT INTO session_progress (id, user_id, session_id, course_id, module_id, completed, completed_at)
+            INSERT INTO lms_session_progress (id, user_id, session_id, course_id, module_id, completed, completed_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """, (progress_id, user["id"], sid, session["course_id"], session["module_id"], True, datetime.now()))
     
@@ -1205,8 +1282,8 @@ def complete_session(sid: str, user=Depends(get_current_user), db=Depends(get_db
 @api_router.get("/sessions/{sid}/progress")
 def get_session_progress(sid: str, user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["session_progress"])
-    cur.execute("SELECT * FROM session_progress WHERE user_id=%s AND session_id=%s", (user["id"], sid))
+    cur.execute(TABLE_SCHEMAS["lms_session_progress"])
+    cur.execute("SELECT * FROM lms_session_progress WHERE user_id=%s AND session_id=%s", (user["id"], sid))
     progress = cur.fetchone()
     return progress or {"completed": False}
 
@@ -1229,21 +1306,21 @@ class QuizSubmit(BaseModel):
 @api_router.get("/quizzes")
 def get_quizzes(course_id: Optional[str] = None, session_id: Optional[str] = None, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(TABLE_SCHEMAS["quizzes"])
+    cur.execute(TABLE_SCHEMAS["lms_quizzes"])
     
     if session_id:
-        cur.execute("SELECT * FROM quizzes WHERE session_id=%s ORDER BY created_at DESC", (session_id,))
+        cur.execute("SELECT * FROM lms_quizzes WHERE session_id=%s ORDER BY created_at DESC", (session_id,))
     elif course_id:
-        cur.execute("SELECT * FROM quizzes WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
+        cur.execute("SELECT * FROM lms_quizzes WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
     else:
-        cur.execute("SELECT * FROM quizzes ORDER BY created_at DESC")
+        cur.execute("SELECT * FROM lms_quizzes ORDER BY created_at DESC")
         
     return cur.fetchall()
 
 @api_router.get("/quizzes/{qid}")
 def get_quiz(qid: str, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM quizzes WHERE id=%s", (qid,))
+    cur.execute("SELECT * FROM lms_quizzes WHERE id=%s", (qid,))
     quiz = cur.fetchone()
     if not quiz:
         raise HTTPException(404, "Quiz not found")
@@ -1259,7 +1336,7 @@ def create_quiz(
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     
     cur.execute("""
-        INSERT INTO quizzes (id, title, course_id, module_id, session_id, questions, passing_score, time_limit_minutes, created_by, created_at)
+        INSERT INTO lms_quizzes (id, title, course_id, module_id, session_id, questions, passing_score, time_limit_minutes, created_by, created_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING *
     """, (qid, quiz_data.title, quiz_data.course_id, quiz_data.module_id, quiz_data.session_id, psycopg2.extras.Json(quiz_data.questions), quiz_data.passing_score, quiz_data.time_limit_minutes, admin["id"], datetime.now()))
@@ -1267,7 +1344,7 @@ def create_quiz(
     new_quiz = cur.fetchone()
     
     # Also update the session to point to this quiz (backward compatibility/convenience)
-    cur.execute("UPDATE sessions SET quiz_id=%s WHERE id=%s", (qid, quiz_data.session_id))
+    cur.execute("UPDATE lms_sessions SET quiz_id=%s WHERE id=%s", (qid, quiz_data.session_id))
     
     db.commit()
     return new_quiz
@@ -1275,7 +1352,7 @@ def create_quiz(
 @api_router.post("/quizzes/{qid}/submit")
 def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM quizzes WHERE id=%s", (qid,))
+    cur.execute("SELECT * FROM lms_quizzes WHERE id=%s", (qid,))
     quiz = cur.fetchone()
     if not quiz:
         raise HTTPException(404, "Quiz not found")
@@ -1300,7 +1377,7 @@ def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=D
     
     attempt_id = generate_id()
     cur.execute("""
-        INSERT INTO quiz_attempts (id, quiz_id, user_id, score, passed, responses)
+        INSERT INTO lms_quiz_attempts (id, quiz_id, user_id, score, passed, responses)
         VALUES (%s, %s, %s, %s, %s, %s)
         RETURNING *
     """, (attempt_id, qid, user["id"], score, passed, psycopg2.extras.Json(responses)))
@@ -1312,7 +1389,103 @@ def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=D
 
 
 
-# ==================== HEALTH ====================
+# ==================== MEDIA STORAGE ====================
+MAX_FILE_SIZE = 50 * 1024 * 1024 # 50MB
+
+@api_router.post("/media/upload")
+async def upload_media(
+    file: UploadFile = File(...),
+    user=Depends(get_current_user),
+    db=Depends(get_db)
+):
+    # Read file data
+    file_data = await file.read()
+    file_size = len(file_data)
+    
+    # Validation: Size
+    if file_size > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Max size is {MAX_FILE_SIZE/(1024*1024)}MB")
+    
+    file_id = generate_id()
+    
+    # Infer file type accurately
+    content_type = file.content_type or "application/octet-stream"
+    file_type = "other"
+    if content_type.startswith("image/"):
+        file_type = "image"
+    elif content_type.startswith("video/"):
+        file_type = "video"
+    elif content_type.startswith("audio/"):
+        file_type = "audio"
+    elif content_type == "application/pdf":
+        file_type = "pdf"
+        
+    cur = db.cursor()
+    try:
+        cur.execute(TABLE_SCHEMAS["lms_media_files"])
+        cur.execute("""
+            INSERT INTO lms_media_files (id, file_name, file_type, mime_type, file_data, file_size, uploaded_by)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(file_data), file_size, user["id"]))
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"Database error during upload: {e}")
+        raise HTTPException(500, "Failed to store file in database")
+    
+    return {
+        "id": file_id,
+        "file_name": file.filename,
+        "file_type": file_type,
+        "mime_type": content_type,
+        "file_size": file_size
+    }
+
+@api_router.get("/media/{mid}")
+async def get_media(mid: str, db=Depends(get_db)):
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT file_name, mime_type, file_data, file_size FROM lms_media_files WHERE id=%s", (mid,))
+    media = cur.fetchone()
+    if not media:
+        raise HTTPException(404, "Media not found")
+        
+    # Return directly for small files, or use StreamingResponse if needed
+    # Since it's in BYTEA, it's already in memory when fetched.
+    return Response(
+        content=bytes(media["file_data"]),
+        media_type=media["mime_type"],
+        headers={
+            "Content-Disposition": f"inline; filename=\"{media['file_name']}\"",
+            "Cache-Control": "public, max-age=31536000",
+            "Accept-Ranges": "bytes"
+        }
+    )
+
+@api_router.get("/media/stream/{mid}")
+async def stream_media(mid: str, db=Depends(get_db)):
+    from fastapi import Request
+    
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT file_name, mime_type, file_data, file_size FROM lms_media_files WHERE id=%s", (mid,))
+    media = cur.fetchone()
+    if not media:
+        raise HTTPException(404, "Media not found")
+        
+    file_data = bytes(media["file_data"])
+    
+    # Simple stream for now, for real streaming we need to handle Range headers manually 
+    # if we don't want to load everything into memory. 
+    # However, since it's already in a variable from Postgres, it's already in memory.
+    
+    return StreamingResponse(
+        io.BytesIO(file_data),
+        media_type=media["mime_type"],
+        headers={
+            "Content-Disposition": f"inline; filename=\"{media['file_name']}\"",
+            "Accept-Ranges": "bytes"
+        }
+    )
+
 @api_router.get("/health")
 def health():
     return {"status":"ok","time":datetime.now()}
@@ -1329,7 +1502,6 @@ app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

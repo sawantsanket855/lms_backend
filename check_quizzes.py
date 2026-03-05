@@ -18,9 +18,9 @@ cur = conn.cursor(cursor_factory=RealDictCursor)
 
 def check_quizzes():
     try:
-        cur.execute("SELECT * FROM quizzes")
+        cur.execute("SELECT * FROM lms_quizzes")
         quizzes = cur.fetchall()
-        print(f"Total quizzes found: {len(quizzes)}")
+        print(f"Total lms_quizzes found: {len(quizzes)}")
         for q in quizzes:
             print(f"ID: {q['id']}, Title: {q['title']}, Session ID: {q['session_id']}")
     except Exception as e:
