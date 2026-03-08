@@ -647,6 +647,15 @@ def add_module(cid: str, module: ModuleContent, admin=Depends(require_admin), db
     
     return get_course(cid, db=db, user=admin)
 
+@api_router.put("/courses/{cid}/modules/reorder")
+def reorder_modules(cid: str, req: ReorderRequest, admin=Depends(require_admin), db=Depends(get_db)):
+    module_ids = req.ids
+    cur = db.cursor()
+    for i, mid in enumerate(module_ids):
+        cur.execute("UPDATE lms_modules SET order_index=%s WHERE id=%s AND course_id=%s", (i, mid, cid))
+    db.commit()
+    return get_course(cid, db=db, user=admin)
+
 @api_router.put("/courses/{cid}/modules/{mid}")
 def update_module(cid: str, mid: str, module: ModuleContent, admin=Depends(require_admin), db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -662,15 +671,6 @@ def delete_module(cid: str, mid: str, admin=Depends(require_admin), db=Depends(g
     cur.execute("DELETE FROM lms_modules WHERE id=%s AND course_id=%s RETURNING id", (mid, cid))
     if not cur.fetchone():
         raise HTTPException(404, "Module not found")
-    db.commit()
-    return get_course(cid, db=db, user=admin)
-
-@api_router.put("/courses/{cid}/modules/reorder")
-def reorder_modules(cid: str, req: ReorderRequest, admin=Depends(require_admin), db=Depends(get_db)):
-    module_ids = req.ids
-    cur = db.cursor()
-    for i, mid in enumerate(module_ids):
-        cur.execute("UPDATE lms_modules SET order_index=%s WHERE id=%s AND course_id=%s", (i, mid, cid))
     db.commit()
     return get_course(cid, db=db, user=admin)
 
@@ -1158,6 +1158,7 @@ async def update_session(
     quiz_id: Optional[str] = Form(None),
     content_url: Optional[str] = Form(None),
     image_url: Optional[str] = Form(None),
+    media_id: Optional[str] = Form(None),
     is_document_available: Optional[str] = Form(None),
     admin=Depends(require_admin),
     db=Depends(get_db)
@@ -1206,6 +1207,10 @@ async def update_session(
         updates.append("image_url=%s")
         values.append(image_url)
         
+    if media_id is not None:
+        updates.append("media_id=%s")
+        values.append(media_id)
+        
     if is_document_available is not None:
         is_doc = is_document_available.lower() == "true"
         updates.append("is_document_available=%s")
@@ -1217,9 +1222,22 @@ async def update_session(
     values.append(sid)
     query = f"UPDATE lms_sessions SET {', '.join(updates)} WHERE id=%s RETURNING *"
     
+    # Save the old media_id to delete the file later if it changed
+    old_media_id = session.get("media_id")
+    
     cur.execute(query, tuple(values))
     updated_session = cur.fetchone()
     db.commit()
+    
+    # Delete old media file if a new one was provided
+    if media_id is not None and old_media_id and old_media_id != media_id:
+        try:
+            cur.execute("DELETE FROM lms_media_files WHERE id=%s", (old_media_id,))
+            db.commit()
+            print(f"Deleted old media file {old_media_id} for session {sid}")
+        except Exception as e:
+            print(f"Failed to delete old media {old_media_id}: {e}")
+            db.rollback()
     
     return updated_session
 
@@ -1362,6 +1380,7 @@ def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=D
     
     correct_count = 0
     total_questions = len(questions)
+    results = []
     
     for q in questions:
         q_id = str(q.get("id"))
@@ -1369,8 +1388,15 @@ def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=D
         correct_ans = q.get("correctOption") if q.get("correctOption") is not None else q.get("answer")
         
         # ensure type conversion matches for comparison
-        if str(user_ans) == str(correct_ans):
+        is_correct = str(user_ans) == str(correct_ans)
+        if is_correct:
             correct_count += 1
+            
+        results.append({
+            "question_id": q_id,
+            "correct": is_correct,
+            "correct_answer": correct_ans
+        })
             
     score = int((correct_count / total_questions) * 100) if total_questions > 0 else 0
     passed = score >= (quiz.get("passing_score") or 70)
@@ -1384,7 +1410,15 @@ def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=D
     
     attempt = cur.fetchone()
     db.commit()
-    return {"score": score, "passed": passed, "attempt": attempt}
+    
+    return {
+        "score": score,
+        "passed": passed,
+        "correct_answers": correct_count,
+        "total_questions": total_questions,
+        "results": results,
+        "attempt": attempt
+    }
 
 
 
