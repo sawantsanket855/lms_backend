@@ -202,6 +202,16 @@ TABLE_SCHEMAS = {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """,
+    "lms_replies": """
+        CREATE TABLE IF NOT EXISTS lms_replies (
+            id TEXT PRIMARY KEY,
+            discussion_id TEXT REFERENCES lms_discussions(id) ON DELETE CASCADE,
+            content TEXT NOT NULL,
+            author_id TEXT,
+            author_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """,
     "lms_expert_questions": """
         CREATE TABLE IF NOT EXISTS lms_expert_questions (
             id TEXT PRIMARY KEY,
@@ -1572,20 +1582,51 @@ def create_quiz(data: Dict[str, Any], admin=Depends(require_admin), db=Depends(g
 
 
 
+
 # ==================== DISCUSSIONS ====================
+
 @api_router.get("/discussions")
 def get_discussions(course_id: Optional[str] = None, db=Depends(get_db)):
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         cur.execute(TABLE_SCHEMAS["lms_discussions"])
+        cur.execute(TABLE_SCHEMAS["lms_replies"])
+        
         if course_id:
             cur.execute("SELECT * FROM lms_discussions WHERE course_id=%s ORDER BY created_at DESC", (course_id,))
         else:
             cur.execute("SELECT * FROM lms_discussions ORDER BY created_at DESC")
-        return cur.fetchall()
-    except:
+        
+        discussions = cur.fetchall()
+        
+        # Fetch replies for these discussions
+        for d in discussions:
+            cur.execute("SELECT * FROM lms_replies WHERE discussion_id=%s ORDER BY created_at ASC", (d["id"],))
+            d["replies"] = cur.fetchall()
+            
+        return discussions
+    except Exception as e:
+        print(f"Error fetching discussions: {e}")
         db.rollback()
         return []
+
+@api_router.post("/discussions/{did}/reply")
+def add_reply(did: str, data: Dict[str, Any], user=Depends(get_current_user), db=Depends(get_db)):
+    rid = generate_id()
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    try:
+        cur.execute(TABLE_SCHEMAS["lms_replies"])
+        cur.execute("""
+            INSERT INTO lms_replies (id, discussion_id, content, author_id, author_name, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING *
+        """, (rid, did, data.get("content"), user["id"], user["name"], datetime.now()))
+        reply = cur.fetchone()
+        db.commit()
+        return reply
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, str(e))
 
 @api_router.post("/discussions")
 def create_discussion(data: Dict[str, Any], user=Depends(get_current_user), db=Depends(get_db)):
