@@ -2599,7 +2599,7 @@ async def upload_media(
         print("DEBUG: Acquiring DB connection from pool manually...")
         db = pool.getconn()
         try:
-            # PING the connection to ensure it's not stale (prevents SSL SYSCALL EOF errors)
+            # PING the connection to ensure it's not stale
             try:
                 with db.cursor() as ping_cur:
                     ping_cur.execute("SELECT 1")
@@ -2611,24 +2611,47 @@ async def upload_media(
                 db = pool.getconn()
 
             cur = db.cursor()
-            # Set a high statement timeout (3 minutes) specifically for this upload transaction
-            cur.execute("SET statement_timeout = 180000")
+            # Set a high statement timeout (5 minutes)
+            cur.execute("SET statement_timeout = 300000")
             
-            print(f"DEBUG: Attempting DB insert for file_id: {file_id}...")
+            # 1. INITIAL INSERT (Metadata + First small chunk)
+            # We send 1KB initially to satisfy the 'BYTEA NOT NULL' constraint.
+            # This avoids the "Large Literal" memory spike in the initial SQL parse.
+            print(f"DEBUG: Initializing file record for id: {file_id}...")
+            initial_chunk = file_data[:1024]
             cur.execute("""
                 INSERT INTO lms_media_files (id, file_name, file_type, mime_type, file_data, file_size, uploaded_by)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(file_data), file_size, uid))
+            """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(initial_chunk), file_size, uid))
             db.commit()
-            print("DEBUG: DB commit successful.")
+
+            # 2. CHUNKED APPEND (Remaining data)
+            # We append 2MB at a time using 'SET col = col || %s'.
+            # This is significantly more stable for low-memory database servers.
+            print(f"DEBUG: Beginning chunked append (total remaining: {len(file_data)-1024} bytes)...")
+            remaining_data = file_data[1024:]
+            chunk_size = 2 * 1024 * 1024 # 2MB
+            
+            for i in range(0, len(remaining_data), chunk_size):
+                chunk = remaining_data[i : i + chunk_size]
+                chunk_num = (i // chunk_size) + 1
+                print(f"DEBUG: Appending chunk #{chunk_num} ({len(chunk)} bytes)...")
+                cur.execute("""
+                    UPDATE lms_media_files 
+                    SET file_data = file_data || %s 
+                    WHERE id = %s
+                """, (psycopg2.Binary(chunk), file_id))
+                db.commit()
+            
+            print("DEBUG: --- All chunks committed successfully ---")
         except Exception as db_err:
-            print(f"DEBUG: Critical database error during upload: {db_err}")
+            print(f"DEBUG: Critical database error during chunked upload: {db_err}")
             # Safely handle rollback
             try:
                 if db and not getattr(db, 'closed', False):
                     db.rollback()
             except:
-                print("DEBUG: ---Rollback failed (connection likely already closed by server)---")
+                pass
             raise HTTPException(500, f"Database storage error: {str(db_err)}")
         finally:
             print("DEBUG: Finalizing: Returning connection to pool.")
