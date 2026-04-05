@@ -491,22 +491,29 @@ def create_access_token(data):
     data["exp"] = datetime.now() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db=Depends(get_db)
+def get_current_user_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security)
 ):
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         uid = payload.get("sub")
-        cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(TABLE_SCHEMAS["lms_users"])
-        cur.execute("SELECT * FROM lms_users WHERE id=%s", (uid,))
-        user = cur.fetchone()
-        if not user:
-            raise HTTPException(401, "User not found")
-        return user
+        if not uid:
+            raise HTTPException(401, "Invalid token")
+        return uid
     except JWTError:
         raise HTTPException(401, "Invalid token")
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+    db=Depends(get_db)
+):
+    uid = get_current_user_id(credentials)
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM lms_users WHERE id=%s", (uid,))
+    user = cur.fetchone()
+    if not user:
+        raise HTTPException(401, "User not found")
+    return user
 
 def require_admin(user=Depends(get_current_user)):
     if user["role"] != "admin":
@@ -2554,15 +2561,14 @@ def submit_quiz(qid: str, data: QuizSubmit, user=Depends(get_current_user), db=D
 
 
 # ==================== MEDIA STORAGE ====================
-MAX_FILE_SIZE = 50 * 1024 * 1024 # 50MB
+MAX_FILE_SIZE = 200 * 1024 * 1024 # 200MB (Safe for 512MB RAM plan)
 
 @api_router.post("/media/upload")
 async def upload_media(
     file: UploadFile = File(...),
-    user=Depends(get_current_user),
-    db=Depends(get_db)
+    uid=Depends(get_current_user_id)
 ):
-    # Read file data
+    # Read file data (long-running part - do NOT hold DB connection during this)
     file_data = await file.read()
     file_size = len(file_data)
     
@@ -2584,18 +2590,23 @@ async def upload_media(
     elif content_type == "application/pdf":
         file_type = "pdf"
         
+    # Now acquire DB connection to save
+    db = next(get_db())
     cur = db.cursor()
     try:
         cur.execute(TABLE_SCHEMAS["lms_media_files"])
         cur.execute("""
             INSERT INTO lms_media_files (id, file_name, file_type, mime_type, file_data, file_size, uploaded_by)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(file_data), file_size, user["id"]))
+        """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(file_data), file_size, uid))
         db.commit()
     except Exception as e:
         db.rollback()
         print(f"Database error during upload: {e}")
         raise HTTPException(500, "Failed to store file in database")
+    finally:
+        # Manually return to pool since we didn't use Depends()
+        pool.putconn(db)
     
     return {
         "id": file_id,
