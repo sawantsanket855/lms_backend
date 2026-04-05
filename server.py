@@ -2568,53 +2568,71 @@ async def upload_media(
     file: UploadFile = File(...),
     uid=Depends(get_current_user_id)
 ):
-    # Read file data (long-running part - do NOT hold DB connection during this)
-    file_data = await file.read()
-    file_size = len(file_data)
-    
-    # Validation: Size
-    if file_size > MAX_FILE_SIZE:
-        raise HTTPException(413, f"File too large. Max size is {MAX_FILE_SIZE/(1024*1024)}MB")
-    
-    file_id = generate_id()
-    
-    # Infer file type accurately
-    content_type = file.content_type or "application/octet-stream"
-    file_type = "other"
-    if content_type.startswith("image/"):
-        file_type = "image"
-    elif content_type.startswith("video/"):
-        file_type = "video"
-    elif content_type.startswith("audio/"):
-        file_type = "audio"
-    elif content_type == "application/pdf":
-        file_type = "pdf"
-        
-    # Now acquire DB connection to save
-    db = next(get_db())
-    cur = db.cursor()
+    print(f"DEBUG: --- Start upload request for file: {file.filename}, user: {uid} ---")
     try:
-        cur.execute(TABLE_SCHEMAS["lms_media_files"])
-        cur.execute("""
-            INSERT INTO lms_media_files (id, file_name, file_type, mime_type, file_data, file_size, uploaded_by)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(file_data), file_size, uid))
-        db.commit()
+        # Read file data (this part can be slow)
+        print("DEBUG: Reading file data...")
+        file_data = await file.read()
+        file_size = len(file_data)
+        print(f"DEBUG: Finished reading {file_size} bytes.")
+        
+        # Validation: Size
+        if file_size > MAX_FILE_SIZE:
+            print(f"DEBUG: REJECTED - File too large ({file_size} > {MAX_FILE_SIZE})")
+            raise HTTPException(413, f"File too large. Max size is {MAX_FILE_SIZE/(1024*1024)}MB")
+        
+        file_id = generate_id()
+        
+        # Infer file type accurately
+        content_type = file.content_type or "application/octet-stream"
+        file_type = "other"
+        if content_type.startswith("image/"):
+            file_type = "image"
+        elif content_type.startswith("video/"):
+            file_type = "video"
+        elif content_type.startswith("audio/"):
+            file_type = "audio"
+        elif content_type == "application/pdf":
+            file_type = "pdf"
+            
+        # Now acquire DB connection to save
+        print("DEBUG: Acquiring DB connection from pool manually...")
+        db = pool.getconn()
+        cur = db.cursor()
+        try:
+            # cur.execute(TABLE_SCHEMAS["lms_media_files"]) # redundant but safe
+            print(f"DEBUG: Attempting DB insert for file_id: {file_id}...")
+            cur.execute("""
+                INSERT INTO lms_media_files (id, file_name, file_type, mime_type, file_data, file_size, uploaded_by)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (file_id, file.filename, file_type, content_type, psycopg2.Binary(file_data), file_size, uid))
+            db.commit()
+            print("DEBUG: DB commit successful.")
+        except Exception as db_err:
+            db.rollback()
+            print(f"DEBUG: Database error during upload: {db_err}")
+            raise HTTPException(500, f"Database error: {str(db_err)}")
+        finally:
+            print("DEBUG: Returning connection to pool.")
+            pool.putconn(db)
+        
+        print("DEBUG: Upload endpoint returning success.")
+        return {
+            "id": file_id,
+            "file_name": file.filename,
+            "file_type": file_type,
+            "mime_type": content_type,
+            "file_size": file_size
+        }
+    except HTTPException as he:
+        print(f"DEBUG: Request failed with HTTP {he.status_code}: {he.detail}")
+        raise he
     except Exception as e:
-        db.rollback()
-        print(f"Database error during upload: {e}")
-        raise HTTPException(500, "Failed to store file in database")
-    finally:
-        # Manually return to pool since we didn't use Depends()
-        pool.putconn(db)
-    
-    return {
-        "id": file_id,
-        "file_name": file.filename,
-        "file_type": file_type,
-        "mime_type": content_type,
-        "file_size": file_size
-    }
+        print(f"DEBUG: UNEXPECTED crash in upload_media: {e}")
+        import traceback
+        traceback.print_exc()
+        # Even if we crash, we must return a response to avoid CORS issues
+        raise HTTPException(500, f"Critical error: {str(e)}")
 
 @api_router.get("/media/{mid}")
 async def get_media(mid: str, db=Depends(get_db)):
