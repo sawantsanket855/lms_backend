@@ -2598,9 +2598,22 @@ async def upload_media(
         # Now acquire DB connection to save
         print("DEBUG: Acquiring DB connection from pool manually...")
         db = pool.getconn()
-        cur = db.cursor()
         try:
-            # cur.execute(TABLE_SCHEMAS["lms_media_files"]) # redundant but safe
+            # PING the connection to ensure it's not stale (prevents SSL SYSCALL EOF errors)
+            try:
+                with db.cursor() as ping_cur:
+                    ping_cur.execute("SELECT 1")
+                print("DEBUG: Connection ping successful.")
+            except:
+                print("DEBUG: ---STALE CONNECTION detected, attempting rotation---")
+                try: pool.putconn(db, close=True)
+                except: pass
+                db = pool.getconn()
+
+            cur = db.cursor()
+            # Set a high statement timeout (3 minutes) specifically for this upload transaction
+            cur.execute("SET statement_timeout = 180000")
+            
             print(f"DEBUG: Attempting DB insert for file_id: {file_id}...")
             cur.execute("""
                 INSERT INTO lms_media_files (id, file_name, file_type, mime_type, file_data, file_size, uploaded_by)
@@ -2609,12 +2622,18 @@ async def upload_media(
             db.commit()
             print("DEBUG: DB commit successful.")
         except Exception as db_err:
-            db.rollback()
-            print(f"DEBUG: Database error during upload: {db_err}")
-            raise HTTPException(500, f"Database error: {str(db_err)}")
+            print(f"DEBUG: Critical database error during upload: {db_err}")
+            # Safely handle rollback
+            try:
+                if db and not getattr(db, 'closed', False):
+                    db.rollback()
+            except:
+                print("DEBUG: ---Rollback failed (connection likely already closed by server)---")
+            raise HTTPException(500, f"Database storage error: {str(db_err)}")
         finally:
-            print("DEBUG: Returning connection to pool.")
-            pool.putconn(db)
+            print("DEBUG: Finalizing: Returning connection to pool.")
+            if db:
+                pool.putconn(db)
         
         print("DEBUG: Upload endpoint returning success.")
         return {
