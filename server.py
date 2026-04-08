@@ -15,6 +15,11 @@ from datetime import datetime, timedelta
 from passlib.context import CryptContext
 from jose import jwt, JWTError
 from fastapi.exceptions import RequestValidationError
+import secrets
+import random
+import sib_api_v3_sdk
+from sib_api_v3_sdk.rest import ApiException
+import base64
 
 # ==================== ENV & APP ====================
 ROOT_DIR = Path(__file__).parent
@@ -295,6 +300,22 @@ TABLE_SCHEMAS = {
             issued_by TEXT,
             issued_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """,
+    "lms_reset_tokens": """
+        CREATE TABLE IF NOT EXISTS lms_reset_tokens (
+            email TEXT NOT NULL,
+            token TEXT NOT NULL,
+            gen_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_used BOOLEAN DEFAULT FALSE
+        )
+    """,
+    "lms_otps": """
+        CREATE TABLE IF NOT EXISTS lms_otps (
+            email TEXT NOT NULL,
+            otp TEXT NOT NULL,
+            gen_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            is_used BOOLEAN DEFAULT FALSE
+        )
     """
 }
 
@@ -513,7 +534,7 @@ def require_admin(user=Depends(get_current_user)):
         raise HTTPException(403, "Admin only")
     return user
 
-# ==================== NOTIFICATIONS ====================
+# ==================== NOTIFICATIONS & EMAIL ====================
 def create_notification(uid, msg, ntype, db):
     cur = db.cursor()
     cur.execute(TABLE_SCHEMAS["lms_notifications"])
@@ -523,6 +544,60 @@ def create_notification(uid, msg, ntype, db):
         VALUES (%s,%s,%s,%s,%s,%s)
     """, (generate_id(), uid, msg, ntype, False, datetime.now()))
     db.commit()
+
+# Brevo Configuration
+configuration = sib_api_v3_sdk.Configuration()
+configuration.api_key['api-key'] = os.getenv("SENDINBLUE_KEY")
+api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
+
+def get_email_template(content_html, title="LMS-PLSRD"):
+    return f"""
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f8fafc; margin: 0; padding: 0; color: #1e293b; }}
+            .container {{ max-width: 600px; margin: 40px auto; background: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1); }}
+            .header {{ background-color: #6366f1; padding: 32px; text-align: center; }}
+            .header h1 {{ margin: 0; color: #ffffff; font-size: 24px; font-weight: 700; }}
+            .content {{ padding: 40px; line-height: 1.6; }}
+            .item-content {{ font-size: 16px; color: #1e293b; margin-bottom: 24px; }}
+            .footer {{ background-color: #f1f5f9; padding: 24px; text-align: center; color: #64748b; font-size: 14px; border-top: 1px solid #e2e8f0; }}
+            .button {{ display: inline-block; padding: 14px 28px; background-color: #6366f1; color: #ffffff !important; text-decoration: none; border-radius: 8px; font-weight: 600; margin-top: 10px; }}
+            .otp-box {{ background-color: #f1f5f9; padding: 24px; border-radius: 12px; text-align: center; margin: 24px 0; font-size: 32px; font-weight: 700; color: #6366f1; letter-spacing: 4px; }}
+            .warning {{ font-size: 13px; color: #94a3b8; margin-top: 32px; border-top: 1px solid #f1f5f9; padding-top: 16px; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>{title}</h1>
+            </div>
+            <div class="content">
+                {content_html}
+            </div>
+            <div class="footer">
+                &copy; {datetime.now().year} LMS-PLSRD. All rights reserved.
+            </div>
+        </div>
+    </body>
+    </html>
+    """
+
+def send_mail(subject, to_email, html_content):
+    try:
+        send_smtp_email = sib_api_v3_sdk.SendSmtpEmail(
+            to=[{"email": to_email}],
+            sender={"email": 'sanketsawant4123@gmail.com', "name": "LMS-PLSRD"},
+            subject=subject,
+            html_content=html_content
+        )
+        api_instance.send_transac_email(send_smtp_email)
+        return True
+    except Exception as e:
+        print(f"❌ Error sending email to {to_email}: {e}")
+        return False
 
 # ==================== AUTH ROUTES ====================
 @api_router.post("/auth/register")
@@ -565,6 +640,29 @@ def register(user: UserCreate, db=Depends(get_db)):
     user_data = dict(new_user)
     user_data.pop("password_hash", None)
     
+    # Send welcome email for students
+    if user.role == "student":
+        login_link = "http://localhost:8081"
+        email_content = f"""
+        <div class="item-content">
+            <p>Hello <b>{user.name}</b>,</p>
+            <p>Your student account has been created successfully for <b>LMS-PLSRD</b>. You can now access your learning dashboard using the credentials below:</p>
+            <div class="otp-box" style="font-size: 16px; text-align: left; padding: 20px; letter-spacing: normal;">
+                <p style="margin: 0; color: #475569;"><b>Email:</b> {user.email.lower()}</p>
+                <p style="margin: 8px 0 0 0; color: #475569;"><b>Password:</b> {user.password}</p>
+            </div>
+            <p style="text-align: center; margin-top: 30px;">
+                <a href="{login_link}" class="button">Login Now</a>
+            </p>
+            <p>We recommend changing your password after your first login.</p>
+        </div>
+        """
+        send_mail(
+            "Welcome to LMS-PLSRD", 
+            user.email.lower(), 
+            get_email_template(email_content, "Account Created")
+        )
+
     return {
         "access_token": create_access_token({"sub": uid}),
         "user": user_data
@@ -576,13 +674,133 @@ def login(data: Dict[str,str], db=Depends(get_db)):
     cur.execute(TABLE_SCHEMAS["lms_users"])
     cur.execute("SELECT * FROM lms_users WHERE email=%s", (data["email"].lower(),))
     user = cur.fetchone()
-    if not user or not data["password"] == user["password_hash"]:
-        raise HTTPException(401, "Invalid credentials")
+    if not user:
+        raise HTTPException(404, "Account not found")
+    if not data["password"] == user["password_hash"]:
+        raise HTTPException(401, "Invalid password")
     
     # Remove sensitive data from user object
     user_data = dict(user)
     user_data.pop("password_hash", None)
     
+    return {
+        "access_token": create_access_token({"sub": user["id"]}),
+        "user": user_data
+    }
+
+@api_router.post("/auth/forgot-password")
+def forgot_password(data: Dict[str, str], db=Depends(get_db)):
+    email = data.get("email", "").lower()
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM lms_users WHERE email=%s", (email,))
+    user = cur.fetchone()
+    if not user:
+        raise HTTPException(404, "Account not found")
+
+    token = secrets.token_urlsafe(32)
+    cur.execute(TABLE_SCHEMAS["lms_reset_tokens"])
+    cur.execute("INSERT INTO lms_reset_tokens (email, token) VALUES (%s, %s)", (email, token))
+    db.commit()
+
+    # In production, replace with your actual frontend domain
+    reset_link = f"http://localhost:8081/reset-password?email={email}&token={token}"
+    
+    email_content = f"""
+    <div class="item-content">
+        <p>Hello,</p>
+        <p>We received a request to reset your password for your <b>LMS-PLSRD</b> account. Click the button below to set a new password:</p>
+        <p style="text-align: center;">
+            <a href="{reset_link}" class="button">Reset Password</a>
+        </p>
+        <p>If you did not request a password reset, please ignore this email.</p>
+        <p>This link will expire in 15 minutes.</p>
+    </div>
+    <div class="warning">
+        <p>If you're having trouble clicking the password reset button, copy and paste the URL below into your web browser:<br>
+        <small>{reset_link}</small></p>
+    </div>
+    """
+    
+    if send_mail("Reset Your Password", email, get_email_template(email_content)):
+        return {"message": "Reset email sent"}
+    else:
+        raise HTTPException(500, "Failed to send email")
+
+@api_router.post("/auth/reset-password")
+def reset_password(data: Dict[str, str], db=Depends(get_db)):
+    email = data.get("email", "").lower()
+    token = data.get("token")
+    new_password = data.get("password")
+
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM lms_reset_tokens 
+        WHERE email=%s AND token=%s AND is_used=FALSE 
+        AND gen_time > NOW() - INTERVAL '15 minutes'
+    """, (email, token))
+    
+    if not cur.fetchone():
+        raise HTTPException(400, "Invalid or expired token")
+
+    cur.execute("UPDATE lms_users SET password_hash=%s WHERE email=%s", (new_password, email))
+    cur.execute("UPDATE lms_reset_tokens SET is_used=TRUE WHERE email=%s AND token=%s", (email, token))
+    db.commit()
+    return {"message": "Password updated successfully"}
+
+@api_router.post("/auth/send-otp")
+def send_otp(data: Dict[str, str], db=Depends(get_db)):
+    email = data.get("email", "").lower()
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM lms_users WHERE email=%s", (email,))
+    user = cur.fetchone()
+    if not user:
+        raise HTTPException(404, "Account not found")
+
+    otp = str(random.randint(1000, 9999))
+    cur.execute(TABLE_SCHEMAS["lms_otps"])
+    cur.execute("INSERT INTO lms_otps (email, otp) VALUES (%s, %s)", (email, otp))
+    db.commit()
+
+    email_content = f"""
+    <div class="item-content">
+        <p>Hello,</p>
+        <p>Your one-time password (OTP) for logging into <b>LMS-PLSRD</b> is:</p>
+        <div class="otp-box">{otp}</div>
+        <p>This code will expire in 5 minutes.</p>
+        <p>If you did not request this OTP, please ignore this email.</p>
+    </div>
+    """
+    
+    if send_mail("Your Login OTP", email, get_email_template(email_content)):
+        return {"message": "OTP sent"}
+    else:
+        raise HTTPException(500, "Failed to send OTP")
+
+@api_router.post("/auth/login-otp")
+def login_otp(data: Dict[str, str], db=Depends(get_db)):
+    email = data.get("email", "").lower()
+    otp = data.get("otp")
+
+    cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("""
+        SELECT * FROM lms_otps 
+        WHERE email=%s AND otp=%s AND is_used=FALSE 
+        AND gen_time > NOW() - INTERVAL '5 minutes'
+        ORDER BY gen_time DESC LIMIT 1
+    """, (email, otp))
+    
+    if not cur.fetchone():
+        raise HTTPException(401, "Invalid or expired OTP")
+
+    cur.execute("UPDATE lms_otps SET is_used=TRUE WHERE email=%s AND otp=%s", (email, otp))
+    
+    cur.execute("SELECT * FROM lms_users WHERE email=%s", (email,))
+    user = cur.fetchone()
+    db.commit()
+
+    user_data = dict(user)
+    user_data.pop("password_hash", None)
+
     return {
         "access_token": create_access_token({"sub": user["id"]}),
         "user": user_data
