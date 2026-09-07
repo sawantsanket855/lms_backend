@@ -2870,7 +2870,9 @@ async def stream_media(mid: str, db=Depends(get_db)):
 
 # ==================== STUDENT ANALYTICS ====================
 @api_router.get("/admin/student/{uid}/analytics")
-def get_student_analytics(uid: str, admin=Depends(require_admin), db=Depends(get_db)):
+def get_student_analytics(uid: str, user=Depends(get_current_user), db=Depends(get_db)):
+    if user["role"] != "admin" and user["id"] != uid:
+        raise HTTPException(status_code=403, detail="Not authorized to view these analytics")
     cur = db.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     
     # 1. Course Progress
